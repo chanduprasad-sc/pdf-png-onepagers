@@ -1,5 +1,5 @@
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
 import re
 import io
 import zipfile
@@ -383,11 +383,11 @@ def build_drive_service(token: dict, config):
 
     expiry = None
     if token.get("expires_at"):
-        expiry = datetime.fromtimestamp(float(token["expires_at"]), timezone.utc)
+        # google-auth compares expiry with a naive UTC datetime internally.
+        expiry = datetime.utcfromtimestamp(float(token["expires_at"]))
     elif token.get("expires_in") and token.get("obtained_at"):
-        expiry = datetime.fromtimestamp(
-            float(token["obtained_at"]) + float(token["expires_in"]),
-            timezone.utc,
+        expiry = datetime.utcfromtimestamp(
+            float(token["obtained_at"]) + float(token["expires_in"])
         )
 
     credentials = Credentials(
@@ -553,8 +553,8 @@ def replace_drive_folder(service, folder_id: str, images: list[tuple[str, bytes]
     return folder["name"], len(existing_items), len(uploaded_ids)
 
 
-def render_drive_sidebar(outputs: list[dict]):
-    with st.sidebar:
+def render_drive_sync_panel(outputs: list[dict]):
+    with st.container(border=True):
         st.header("Google Drive sync")
         st.caption(
             "Replace one Drive folder with the PNGs from your latest conversion."
@@ -815,7 +815,7 @@ if st.session_state.conversion_outputs:
     st.subheader("Your downloads")
     st.caption(
         "Download every PDF separately, or download one master ZIP containing "
-        "all the individual ZIP files. Google Drive sync is available in the sidebar."
+        "all the individual ZIP files."
     )
 
     successful_outputs = sum(
@@ -900,4 +900,5 @@ if st.session_state.conversion_outputs:
                     with preview_cols[preview_index % len(preview_cols)]:
                         st.image(img_bytes, caption=name, use_container_width=True)
 
-render_drive_sidebar(st.session_state.conversion_outputs)
+st.divider()
+render_drive_sync_panel(st.session_state.conversion_outputs)

@@ -36,9 +36,9 @@ Then open the local URL shown by Streamlit in your browser.
 
 ## Optional Google Drive sync
 
-Drive sync appears in the sidebar after the app has converted at least one
-eligible page. It lets you connect a Google account, select a destination
-folder, and replace that folder's direct contents with the latest PNG files.
+Drive sync appears on the main screen after the conversion results. It lets
+you connect a Google account, select a destination folder, and replace that
+folder's direct contents with the latest PNG files.
 Existing items are moved to Google Drive Trash, not permanently deleted.
 
 ### Google Cloud setup
