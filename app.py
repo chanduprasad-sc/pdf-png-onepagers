@@ -13,6 +13,11 @@ GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 GOOGLE_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+DRIVE_ROOT_FOLDER_ID = "1R_fjJmLYUqLPsphGIy1saPo9vP9o7Cp4"
+DRIVE_ROOT_FOLDER_URL = (
+    "https://drive.google.com/drive/folders/"
+    f"{DRIVE_ROOT_FOLDER_ID}"
+)
 
 st.set_page_config(
     page_title="PDF Page Exporter",
@@ -402,28 +407,6 @@ def build_drive_service(token: dict, config):
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
 
-def list_drive_folders(service) -> list[dict]:
-    folders = []
-    page_token = None
-    while True:
-        response = service.files().list(
-            q=(
-                "mimeType = 'application/vnd.google-apps.folder' "
-                "and trashed = false"
-            ),
-            spaces="drive",
-            fields="nextPageToken, files(id, name)",
-            orderBy="name_natural",
-            pageSize=1000,
-            pageToken=page_token,
-        ).execute()
-        folders.extend(response.get("files", []))
-        page_token = response.get("nextPageToken")
-        if not page_token:
-            break
-    return folders
-
-
 def collect_converted_pngs(outputs: list[dict]) -> list[tuple[str, bytes]]:
     """Flatten the latest successful conversions into unique PNG filenames."""
     images = []
@@ -460,7 +443,7 @@ def list_folder_contents(service, folder_id: str) -> list[dict]:
         response = service.files().list(
             q=f"'{folder_id}' in parents and trashed = false",
             fields=(
-                "nextPageToken, files(id, name, "
+                "nextPageToken, files(id, name, mimeType, "
                 "capabilities(canTrash))"
             ),
             pageSize=1000,
@@ -475,8 +458,53 @@ def list_folder_contents(service, folder_id: str) -> list[dict]:
     return contents
 
 
+def list_child_folders(service, root_folder_id: str) -> tuple[dict, list[dict]]:
+    """Return a Drive folder and its immediate, non-trashed child folders."""
+    root_folder = service.files().get(
+        fileId=root_folder_id,
+        fields="id, name, mimeType",
+        supportsAllDrives=True,
+    ).execute()
+    if root_folder.get("mimeType") != "application/vnd.google-apps.folder":
+        raise ValueError("The configured Google Drive root is not a folder.")
+
+    folders = []
+    page_token = None
+    while True:
+        response = service.files().list(
+            q=(
+                f"'{root_folder_id}' in parents and trashed = false and "
+                "mimeType = 'application/vnd.google-apps.folder'"
+            ),
+            fields=(
+                "nextPageToken, files(id, name, "
+                "capabilities(canAddChildren))"
+            ),
+            orderBy="name_natural",
+            pageSize=1000,
+            pageToken=page_token,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ).execute()
+        folders.extend(response.get("files", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+    return root_folder, folders
+
+
+def is_replaceable_drive_image(item: dict) -> bool:
+    """Identify direct PNG/JPG files while excluding folders and other files."""
+    mime_type = (item.get("mimeType") or "").casefold()
+    if mime_type == "application/vnd.google-apps.folder":
+        return False
+    return mime_type in {"image/png", "image/jpeg"} or Path(
+        item.get("name", "")
+    ).suffix.casefold() in {".png", ".jpg", ".jpeg"}
+
+
 def replace_drive_folder(service, folder_id: str, images: list[tuple[str, bytes]]):
-    """Replace a folder's direct contents, with best-effort rollback on error."""
+    """Replace direct PNG/JPG files, with best-effort rollback on error."""
     from googleapiclient.http import MediaIoBaseUpload
 
     folder = service.files().get(
@@ -487,7 +515,11 @@ def replace_drive_folder(service, folder_id: str, images: list[tuple[str, bytes]
     if not folder.get("capabilities", {}).get("canAddChildren", False):
         raise PermissionError("You do not have permission to add files to this folder.")
 
-    existing_items = list_folder_contents(service, folder_id)
+    existing_items = [
+        item
+        for item in list_folder_contents(service, folder_id)
+        if is_replaceable_drive_image(item)
+    ]
     blocked_items = [
         item["name"]
         for item in existing_items
@@ -517,7 +549,7 @@ def replace_drive_folder(service, folder_id: str, images: list[tuple[str, bytes]
             ).execute()
             uploaded_ids.append(created["id"])
 
-        # All uploads succeeded; move the previous direct contents to Trash.
+        # All uploads succeeded; move only previous direct image files to Trash.
         for item in existing_items:
             service.files().update(
                 fileId=item["id"],
@@ -553,17 +585,30 @@ def replace_drive_folder(service, folder_id: str, images: list[tuple[str, bytes]
     return folder["name"], len(existing_items), len(uploaded_ids)
 
 
-def render_drive_sync_panel(outputs: list[dict]):
+def parse_drive_folder_id(value: str) -> str | None:
+    """Accept a Google Drive folder URL or a raw Drive folder ID."""
+    value = value.strip()
+    if not value:
+        return None
+    url_match = re.search(r"/folders/([A-Za-z0-9_-]+)", value)
+    if url_match:
+        return url_match.group(1)
+    if re.fullmatch(r"[A-Za-z0-9_-]{10,}", value):
+        return value
+    return None
+
+
+def render_drive_connection(outputs: list[dict]):
     with st.container(border=True):
         st.header("Google Drive sync")
         st.caption(
-            "Replace one Drive folder with the PNGs from your latest conversion."
+            "Connect once, then choose a broker subfolder beside each report."
         )
 
         images = collect_converted_pngs(outputs)
         if not images:
             st.info("Convert at least one eligible PDF page to enable Drive sync.")
-            return
+            return None, []
 
         config = get_google_drive_config()
         if config is None:
@@ -571,13 +616,13 @@ def render_drive_sync_panel(outputs: list[dict]):
                 "Drive sync is not configured yet. Add the `[google_drive]` "
                 "credentials in your Streamlit app secrets."
             )
-            return
+            return None, []
 
         try:
             from streamlit_oauth import OAuth2Component
         except ImportError:
             st.error("Drive sync dependencies are not installed yet.")
-            return
+            return None, []
 
         oauth = OAuth2Component(
             config["client_id"],
@@ -605,95 +650,123 @@ def render_drive_sync_panel(outputs: list[dict]):
                 token = dict(result["token"])
                 token["obtained_at"] = time.time()
                 st.session_state.google_drive_token = token
-                st.session_state.pop("google_drive_folders", None)
                 st.rerun()
-            return
+            return None, []
 
-        disconnect_col, refresh_col = st.columns(2)
+        status_col, disconnect_col = st.columns([1.7, 1], vertical_alignment="center")
+        with status_col:
+            st.success("Google Drive is connected.")
         with disconnect_col:
-            if st.button("Disconnect", use_container_width=True):
+            if st.button("Disconnect Drive", use_container_width=True):
                 try:
                     oauth.revoke_token(st.session_state.google_drive_token)
                 except Exception:
                     pass
                 st.session_state.pop("google_drive_token", None)
-                st.session_state.pop("google_drive_folders", None)
-                st.session_state.pop("drive_sync_confirm", None)
                 st.rerun()
-        with refresh_col:
-            refresh_folders = st.button("Refresh folders", use_container_width=True)
 
         try:
-            previous_token = st.session_state.google_drive_token
-            refreshed_token = oauth.refresh_token(previous_token)
-            if refreshed_token:
-                refreshed_token = dict(refreshed_token)
-                if not refreshed_token.get("refresh_token"):
-                    refreshed_token["refresh_token"] = previous_token.get(
-                        "refresh_token"
-                    )
-                if refreshed_token.get("access_token") != previous_token.get(
-                    "access_token"
-                ):
-                    refreshed_token["obtained_at"] = time.time()
-                else:
-                    refreshed_token["obtained_at"] = previous_token.get(
-                        "obtained_at",
-                        time.time(),
-                    )
-                st.session_state.google_drive_token = refreshed_token
+            # google-auth refreshes expired access tokens during API requests.
             service = build_drive_service(
                 st.session_state.google_drive_token,
                 config,
             )
-            if refresh_folders or "google_drive_folders" not in st.session_state:
-                st.session_state.google_drive_folders = list_drive_folders(service)
+            root_folder, broker_folders = list_child_folders(
+                service,
+                DRIVE_ROOT_FOLDER_ID,
+            )
         except Exception as exc:
             st.error(f"Google Drive connection failed: {exc}")
             if st.button("Reconnect Drive", use_container_width=True):
                 st.session_state.pop("google_drive_token", None)
-                st.session_state.pop("google_drive_folders", None)
                 st.rerun()
-            return
+            return None, []
 
-        folders = st.session_state.google_drive_folders
-        if not folders:
-            st.warning("No Google Drive folders were found for this account.")
-            return
+        root_col, refresh_col = st.columns([1.7, 1], vertical_alignment="center")
+        with root_col:
+            st.markdown(
+                f"**Root folder:** [{root_folder['name']}]({DRIVE_ROOT_FOLDER_URL})  "
+                f"\n{len(broker_folders)} immediate broker subfolder"
+                f"{'s' if len(broker_folders) != 1 else ''} found."
+            )
+        with refresh_col:
+            if st.button("Refresh broker folders", use_container_width=True):
+                st.rerun()
 
-        folder_labels = {
-            folder["id"]: f"{folder['name']} · {folder['id'][-6:]}"
-            for folder in folders
-        }
-        selected_folder_id = st.selectbox(
-            "Destination folder",
-            options=[folder["id"] for folder in folders],
-            format_func=lambda folder_id: folder_labels[folder_id],
-            help="The final six characters help distinguish folders with the same name.",
+        if not broker_folders:
+            st.warning(
+                "No immediate subfolders are visible inside the configured root folder."
+            )
+
+        return service, broker_folders
+
+
+def render_report_drive_sync(
+    service,
+    broker_folders: list[dict],
+    output: dict,
+    output_index: int,
+):
+    images = collect_converted_pngs([output])
+    if not images:
+        return
+
+    if service is None or not broker_folders:
+        st.button(
+            "Sync to Drive",
+            key=f"drive_disabled_{output_index}",
+            disabled=True,
+            help="Connect Google Drive and load its broker subfolders above.",
+            use_container_width=True,
         )
+        return
+
+    with st.popover("Sync to Drive", use_container_width=True):
+        st.write(f"Choose where to sync **{output['original_name']}**.")
+
+        name_counts = {}
+        for folder in broker_folders:
+            name_key = folder["name"].casefold()
+            name_counts[name_key] = name_counts.get(name_key, 0) + 1
+
+        def folder_label(folder: dict) -> str:
+            if name_counts[folder["name"].casefold()] == 1:
+                return folder["name"]
+            return f"{folder['name']} · {folder['id'][-6:]}"
+
+        selected_folder = st.selectbox(
+            "Broker folder",
+            options=broker_folders,
+            format_func=folder_label,
+            key=f"drive_broker_folder_{output_index}",
+            help="Only immediate subfolders of the configured Drive root are shown.",
+        )
+        folder_id = selected_folder["id"]
+        selected_folder_name = selected_folder["name"]
 
         st.warning(
-            f"Sync will move every existing item directly inside this folder to "
-            f"Google Drive Trash, then upload {len(images)} fresh PNG files. "
-            "The selected folder itself is not deleted."
+            f"This will move all PNG/JPG files directly inside "
+            f"“{selected_folder_name}” to Drive Trash, then upload {len(images)} "
+            "new PNGs. Non-image files and nested folders will remain untouched."
         )
         confirmed = st.checkbox(
-            "I understand that the folder's current contents will be replaced.",
-            key="drive_sync_confirm",
+            f"Replace the existing images in “{selected_folder_name}”.",
+            key=f"drive_sync_confirm_{output_index}",
         )
         sync_clicked = st.button(
             f"Replace folder with {len(images)} PNGs",
             type="primary",
             disabled=not confirmed,
+            key=f"drive_sync_{output_index}",
             use_container_width=True,
         )
 
         if sync_clicked:
-            with st.spinner("Replacing the Drive folder contents..."):
+            with st.spinner("Replacing this Drive folder..."):
                 try:
                     folder_name, removed_count, uploaded_count = replace_drive_folder(
                         service,
-                        selected_folder_id,
+                        folder_id,
                         images,
                     )
                 except Exception as exc:
@@ -701,7 +774,7 @@ def render_drive_sync_panel(outputs: list[dict]):
                 else:
                     st.success(
                         f"Synced {uploaded_count} PNGs to “{folder_name}”. "
-                        f"Moved {removed_count} previous items to Trash."
+                        f"Moved {removed_count} previous image files to Trash."
                     )
 
 
@@ -818,6 +891,10 @@ if st.session_state.conversion_outputs:
         "all the individual ZIP files."
     )
 
+    drive_service, broker_folders = render_drive_connection(
+        st.session_state.conversion_outputs
+    )
+
     successful_outputs = sum(
         output["error"] is None for output in st.session_state.conversion_outputs
     )
@@ -856,7 +933,10 @@ if st.session_state.conversion_outputs:
                 st.error(f"This PDF could not be processed: {output['error']}")
                 continue
 
-            result_col, download_col = st.columns([1.7, 1], vertical_alignment="center")
+            result_col, download_col, drive_col = st.columns(
+                [1.7, 0.8, 0.8],
+                vertical_alignment="center",
+            )
             with result_col:
                 st.subheader(output["original_name"])
                 converted_count = len(output["results"])
@@ -881,6 +961,14 @@ if st.session_state.conversion_outputs:
                         key=f"download_{output_index}_{zip_name}",
                         use_container_width=True,
                     )
+            with drive_col:
+                if converted_count:
+                    render_report_drive_sync(
+                        drive_service,
+                        broker_folders,
+                        output,
+                        output_index,
+                    )
 
             if not converted_count:
                 st.warning(
@@ -899,6 +987,3 @@ if st.session_state.conversion_outputs:
                 for preview_index, (name, img_bytes) in enumerate(output["previews"]):
                     with preview_cols[preview_index % len(preview_cols)]:
                         st.image(img_bytes, caption=name, use_container_width=True)
-
-st.divider()
-render_drive_sync_panel(st.session_state.conversion_outputs)

@@ -11,8 +11,8 @@ A simple Streamlit web app that:
 - creates a separate ZIP download for every uploaded PDF
 - creates one master ZIP containing all successful per-PDF ZIP files
 - reports total, converted, and skipped page counts for each PDF
-- optionally connects to Google Drive and replaces a selected folder with all
-  PNGs from the latest conversion batch
+- optionally connects to Google Drive and replaces the PNG/JPG files in a
+  selected broker subfolder with one report's freshly converted PNGs
 
 ## Setup
 
@@ -36,10 +36,13 @@ Then open the local URL shown by Streamlit in your browser.
 
 ## Optional Google Drive sync
 
-Drive sync appears on the main screen after the conversion results. It lets
-you connect a Google account, select a destination folder, and replace that
-folder's direct contents with the latest PNG files.
-Existing items are moved to Google Drive Trash, not permanently deleted.
+Drive sync appears on the main screen with the conversion results. Connect a
+Google account once, then use the **Sync to Drive** action beside each report.
+The app lists the immediate broker subfolders inside the configured root Drive
+folder. Select Axis, SBI, HDFC, or another listed subfolder for that report.
+All PNG/JPG/JPEG files directly inside the selected broker folder are moved to
+Google Drive Trash and replaced by that report's latest PNGs. Non-image files
+and nested folders are preserved.
 
 ### Google Cloud setup
 
