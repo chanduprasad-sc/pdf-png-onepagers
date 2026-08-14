@@ -2,15 +2,14 @@
 
 A simple Streamlit web app that:
 - uploads and processes multiple PDF files in one batch
-- converts portfolio detail pages into PNG images
-- skips cover or welcome pages, how-to or instruction pages, performance
-  pages, disclaimers, and ending or thank-you pages by only including pages
-  with a Research Analyst or Investment Advisor label
+- converts every page from every PDF into a PNG image
 - names pages with a Research Analyst or Investment Advisor in the format
   `<title> by <manager name>`
+- names pages without a manager label using the detected page title
+- lets you review every page and remove unwanted images before download or sync
 - creates a separate ZIP download for every uploaded PDF
 - creates one master ZIP containing all successful per-PDF ZIP files
-- reports total, converted, and skipped page counts for each PDF
+- reports total, kept, and removed page counts for each PDF
 - optionally connects to Google Drive and replaces the PNG/JPG files in a
   selected broker subfolder with one report's freshly converted PNGs
 
@@ -41,8 +40,9 @@ Google account once, then use the **Sync to Drive** action beside each report.
 The app lists the immediate broker subfolders inside the configured root Drive
 folder. Select Axis, SBI, HDFC, or another listed subfolder for that report.
 All PNG/JPG/JPEG files directly inside the selected broker folder are moved to
-Google Drive Trash and replaced by that report's latest PNGs. Non-image files
-and nested folders are preserved.
+Google Drive Trash and replaced by that report's currently selected PNGs.
+Pages unchecked in the review area are not synced. Non-image files and nested
+folders are preserved.
 
 ### Google Cloud setup
 

@@ -297,25 +297,21 @@ def convert_pdf_bytes(pdf_bytes: bytes, original_name: str, zoom: float = 2.0):
         total_pages = len(doc)
         for i, page in enumerate(doc, start=1):
             manager_raw = get_manager_name(page)
-
-            # Portfolio detail pages contain one of the supported manager
-            # labels. Generic cover, how-to, performance, and ending pages do
-            # not, so they are excluded from the output.
-            if not manager_raw:
-                continue
-
-            title_raw = get_page_title(page) or f"page_{i}"
-            display_name = f"{title_raw} by {manager_raw}"
+            title_raw = get_page_title(page) or f"Page {i:03d}"
+            display_name = (
+                f"{title_raw} by {manager_raw}" if manager_raw else title_raw
+            )
             title = safe_name(display_name)
             image_path = unique_path(out_dir / f"{title}.png")
             pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
             pix.save(str(image_path))
+            image_bytes = image_path.read_bytes()
             results.append({
                 "page": i,
                 "title": title,
-                "path": image_path,
                 "folder": pdf_stem,
                 "filename": image_path.name,
+                "image_bytes": image_bytes,
             })
         doc.close()
 
@@ -323,12 +319,12 @@ def convert_pdf_bytes(pdf_bytes: bytes, original_name: str, zoom: float = 2.0):
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             for item in results:
                 arcname = f"{item['folder']}/{item['filename']}"
-                zf.write(item["path"], arcname)
+                zf.writestr(arcname, item["image_bytes"])
         zip_buffer.seek(0)
 
         preview_images = []
         for item in results[:5]:
-            preview_images.append((item["filename"], item["path"].read_bytes()))
+            preview_images.append((item["filename"], item["image_bytes"]))
 
         return total_pages, results, zip_buffer.getvalue(), preview_images
 
@@ -341,6 +337,106 @@ def format_file_size(size_bytes: int) -> str:
 
 def output_zip_name(original_name: str) -> str:
     return f"{safe_name(Path(original_name).stem)}_images.zip"
+
+
+def build_output_zip(output: dict, results: list[dict]) -> bytes:
+    """Build a per-PDF ZIP from only the pages the user chose to keep."""
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_STORED) as archive:
+        for item in results:
+            archive.writestr(
+                f"{item['folder']}/{item['filename']}",
+                item["image_bytes"],
+            )
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
+
+
+def page_selection_key(output: dict, output_index: int, page: int) -> str:
+    batch_id = output.get("batch_id", "current")
+    return f"keep_page_{batch_id}_{output_index}_{page}"
+
+
+def selected_output(output: dict, output_index: int) -> dict:
+    """Return an output copy containing only currently selected pages."""
+    if output["error"] is not None:
+        return output
+
+    kept_results = [
+        item
+        for item in output["results"]
+        if st.session_state.get(
+            page_selection_key(output, output_index, item["page"]),
+            True,
+        )
+    ]
+    filtered = dict(output)
+    filtered["results"] = kept_results
+    filtered["zip_bytes"] = build_output_zip(output, kept_results)
+    filtered["previews"] = [
+        (item["filename"], item["image_bytes"]) for item in kept_results[:5]
+    ]
+    return filtered
+
+
+def render_page_review(output: dict, output_index: int):
+    """Render a compact keep/remove control for every converted PDF page."""
+    kept_count = sum(
+        st.session_state.get(
+            page_selection_key(output, output_index, item["page"]),
+            True,
+        )
+        for item in output["results"]
+    )
+    with st.expander(
+        f"Review pages — {kept_count} of {len(output['results'])} kept",
+        expanded=False,
+    ):
+        st.caption(
+            "Uncheck pages you do not want. Downloads and Drive sync update "
+            "automatically to include only the checked pages."
+        )
+        keep_col, remove_col = st.columns(2)
+        if keep_col.button(
+            "Keep all",
+            key=f"keep_all_{output.get('batch_id', 'current')}_{output_index}",
+            use_container_width=True,
+        ):
+            for item in output["results"]:
+                st.session_state[
+                    page_selection_key(output, output_index, item["page"])
+                ] = True
+            st.rerun()
+        if remove_col.button(
+            "Remove all",
+            key=f"remove_all_{output.get('batch_id', 'current')}_{output_index}",
+            use_container_width=True,
+        ):
+            for item in output["results"]:
+                st.session_state[
+                    page_selection_key(output, output_index, item["page"])
+                ] = False
+            st.rerun()
+
+        review_columns = st.columns(3)
+        for item_index, item in enumerate(output["results"]):
+            with review_columns[item_index % len(review_columns)]:
+                st.image(
+                    item["image_bytes"],
+                    caption=f"Page {item['page']} · {item['filename']}",
+                    use_container_width=True,
+                )
+                selection_key = page_selection_key(
+                    output,
+                    output_index,
+                    item["page"],
+                )
+                if selection_key not in st.session_state:
+                    st.session_state[selection_key] = True
+                st.checkbox(
+                    f"Keep page {item['page']}",
+                    key=selection_key,
+                )
 
 
 def create_batch_zip(outputs: list[dict]) -> bytes:
@@ -784,13 +880,13 @@ st.markdown(
         <div class="app-mark">PNG</div>
         <div>
             <h1>PDF page exporter</h1>
-            <p>Extract portfolio detail pages as crisp PNGs, automatically named using the title and its Research Analyst or Investment Advisor.</p>
+            <p>Convert every PDF page to a crisp PNG, review what you want to keep, then download or sync only your final selection.</p>
         </div>
     </div>
     <div class="workflow-note" aria-label="Conversion steps">
         <span><strong>1.</strong> Select one or more PDFs</span>
-        <span><strong>2.</strong> Keep manager-labelled pages</span>
-        <span><strong>3.</strong> Download a separate ZIP for each PDF</span>
+        <span><strong>2.</strong> Review and remove unwanted pages</span>
+        <span><strong>3.</strong> Download or sync the pages you keep</span>
     </div>
     """,
     unsafe_allow_html=True,
@@ -799,10 +895,9 @@ st.markdown(
 st.subheader("Upload PDFs")
 st.caption("Select multiple files in one go. Each PDF is processed independently.")
 st.info(
-    "**Pages skipped:** cover or welcome pages, how-to or instruction pages, "
-    "performance pages, disclaimers, and ending or thank-you pages. The app "
-    "exports only pages that contain a **Research Analyst** or "
-    "**Investment Advisor** label."
+    "**Every page is converted.** Pages with a Research Analyst or Investment "
+    "Advisor are named `Title by Manager`; all other pages use their detected "
+    "page title. After conversion, uncheck any pages you do not want."
 )
 uploaded_files = st.file_uploader(
     "Choose PDF files",
@@ -846,9 +941,17 @@ if uploaded_files:
 
 if "conversion_outputs" not in st.session_state:
     st.session_state.conversion_outputs = []
+elif any(
+    output.get("results")
+    and "image_bytes" not in output["results"][0]
+    for output in st.session_state.conversion_outputs
+):
+    # Results created by an older app version cannot support page review.
+    st.session_state.conversion_outputs = []
 
 if process and uploaded_files:
     batch_outputs = []
+    batch_id = time.time_ns()
     progress_bar = st.progress(0)
     progress_text = st.empty()
 
@@ -861,6 +964,7 @@ if process and uploaded_files:
                 zoom=zoom,
             )
             batch_outputs.append({
+                "batch_id": batch_id,
                 "original_name": uploaded.name,
                 "total_pages": total_pages,
                 "results": results,
@@ -870,6 +974,7 @@ if process and uploaded_files:
             })
         except Exception as exc:
             batch_outputs.append({
+                "batch_id": batch_id,
                 "original_name": uploaded.name,
                 "total_pages": 0,
                 "results": [],
@@ -891,8 +996,13 @@ if st.session_state.conversion_outputs:
         "all the individual ZIP files."
     )
 
+    selected_conversion_outputs = [
+        selected_output(output, output_index)
+        for output_index, output in enumerate(st.session_state.conversion_outputs)
+    ]
+
     drive_service, broker_folders = render_drive_connection(
-        st.session_state.conversion_outputs
+        selected_conversion_outputs
     )
 
     successful_outputs = sum(
@@ -900,7 +1010,7 @@ if st.session_state.conversion_outputs:
     )
     downloadable_outputs = [
         output
-        for output in st.session_state.conversion_outputs
+        for output in selected_conversion_outputs
         if output["error"] is None and output["results"]
     ]
 
@@ -926,7 +1036,9 @@ if st.session_state.conversion_outputs:
                 use_container_width=True,
             )
 
-    for output_index, output in enumerate(st.session_state.conversion_outputs):
+    for output_index, (source_output, output) in enumerate(
+        zip(st.session_state.conversion_outputs, selected_conversion_outputs)
+    ):
         with st.container(border=True):
             if output["error"]:
                 st.subheader(output["original_name"])
@@ -941,12 +1053,12 @@ if st.session_state.conversion_outputs:
                 st.subheader(output["original_name"])
                 converted_count = len(output["results"])
                 total_pages = output["total_pages"]
-                skipped_count = total_pages - converted_count
+                removed_count = total_pages - converted_count
                 st.markdown(
                     '<div class="result-counts">'
                     f'<span><strong>{total_pages}</strong> total pages</span>'
-                    f'<span><strong>{converted_count}</strong> converted</span>'
-                    f'<span><strong>{skipped_count}</strong> skipped</span>'
+                    f'<span><strong>{converted_count}</strong> kept</span>'
+                    f'<span><strong>{removed_count}</strong> removed</span>'
                     '</div>',
                     unsafe_allow_html=True,
                 )
@@ -972,18 +1084,8 @@ if st.session_state.conversion_outputs:
 
             if not converted_count:
                 st.warning(
-                    "No portfolio pages with a Research Analyst or Investment Advisor "
-                    "were found in this PDF."
+                    "All pages are currently removed. Keep at least one page to "
+                    "enable download and Drive sync."
                 )
-                continue
 
-            with st.expander(f"View all {converted_count} filenames"):
-                for item in output["results"]:
-                    st.write(f"Page {item['page']}: `{item['filename']}`")
-
-            if output["previews"]:
-                st.caption("Preview of the first five pages")
-                preview_cols = st.columns(min(3, len(output["previews"])))
-                for preview_index, (name, img_bytes) in enumerate(output["previews"]):
-                    with preview_cols[preview_index % len(preview_cols)]:
-                        st.image(img_bytes, caption=name, use_container_width=True)
+            render_page_review(source_output, output_index)
