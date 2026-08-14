@@ -6,7 +6,8 @@ A simple Streamlit web app that:
 - names pages with a Research Analyst or Investment Advisor in the format
   `<title> by <manager name>`
 - names pages without a manager label using the detected page title
-- lets you review every page and remove unwanted images before download or sync
+- gives every image a bin button so unwanted pages can be removed before
+  download or sync, with a restore option for accidental removal
 - creates a separate ZIP download for every uploaded PDF
 - creates one master ZIP containing all successful per-PDF ZIP files
 - reports total, kept, and removed page counts for each PDF
@@ -41,7 +42,7 @@ The app lists the immediate broker subfolders inside the configured root Drive
 folder. Select Axis, SBI, HDFC, or another listed subfolder for that report.
 All PNG/JPG/JPEG files directly inside the selected broker folder are moved to
 Google Drive Trash and replaced by that report's currently selected PNGs.
-Pages unchecked in the review area are not synced. Non-image files and nested
+Images removed in the review area are not synced. Non-image files and nested
 folders are preserved.
 
 ### Google Cloud setup

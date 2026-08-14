@@ -380,26 +380,32 @@ def selected_output(output: dict, output_index: int) -> dict:
 
 
 def render_page_review(output: dict, output_index: int):
-    """Render a compact keep/remove control for every converted PDF page."""
-    kept_count = sum(
-        st.session_state.get(
-            page_selection_key(output, output_index, item["page"]),
-            True,
-        )
-        for item in output["results"]
-    )
+    """Render bin actions for kept pages and restore actions for removed pages."""
+    kept_items = []
+    removed_items = []
+    for item in output["results"]:
+        selection_key = page_selection_key(output, output_index, item["page"])
+        if selection_key not in st.session_state:
+            st.session_state[selection_key] = True
+        if st.session_state[selection_key]:
+            kept_items.append(item)
+        else:
+            removed_items.append(item)
+
     with st.expander(
-        f"Review pages — {kept_count} of {len(output['results'])} kept",
-        expanded=False,
+        f"Review images — {len(kept_items)} of {len(output['results'])} kept",
+        expanded=True,
     ):
         st.caption(
-            "Uncheck pages you do not want. Downloads and Drive sync update "
-            "automatically to include only the checked pages."
+            "Use the bin button to remove an image. Downloads and Drive sync "
+            "automatically include only the images that remain."
         )
         keep_col, remove_col = st.columns(2)
         if keep_col.button(
-            "Keep all",
+            "Restore all",
+            icon=":material/restore:",
             key=f"keep_all_{output.get('batch_id', 'current')}_{output_index}",
+            disabled=not removed_items,
             use_container_width=True,
         ):
             for item in output["results"]:
@@ -408,8 +414,10 @@ def render_page_review(output: dict, output_index: int):
                 ] = True
             st.rerun()
         if remove_col.button(
-            "Remove all",
+            "Delete all",
+            icon=":material/delete_sweep:",
             key=f"remove_all_{output.get('batch_id', 'current')}_{output_index}",
+            disabled=not kept_items,
             use_container_width=True,
         ):
             for item in output["results"]:
@@ -418,8 +426,14 @@ def render_page_review(output: dict, output_index: int):
                 ] = False
             st.rerun()
 
+        if not kept_items:
+            st.info(
+                "No images are currently selected. Restore an image below to "
+                "enable download and Drive sync."
+            )
+
         review_columns = st.columns(3)
-        for item_index, item in enumerate(output["results"]):
+        for item_index, item in enumerate(kept_items):
             with review_columns[item_index % len(review_columns)]:
                 st.image(
                     item["image_bytes"],
@@ -431,12 +445,40 @@ def render_page_review(output: dict, output_index: int):
                     output_index,
                     item["page"],
                 )
-                if selection_key not in st.session_state:
-                    st.session_state[selection_key] = True
-                st.checkbox(
-                    f"Keep page {item['page']}",
-                    key=selection_key,
-                )
+                if st.button(
+                    f"Delete page {item['page']}",
+                    icon=":material/delete:",
+                    key=f"delete_{selection_key}",
+                    use_container_width=True,
+                ):
+                    st.session_state[selection_key] = False
+                    st.rerun()
+
+        if removed_items:
+            st.divider()
+            st.markdown(f"**Removed images ({len(removed_items)})**")
+            st.caption("Removed images are excluded from download and Drive sync.")
+            removed_columns = st.columns(3)
+            for item_index, item in enumerate(removed_items):
+                with removed_columns[item_index % len(removed_columns)]:
+                    st.image(
+                        item["image_bytes"],
+                        caption=f"Page {item['page']} · {item['filename']}",
+                        use_container_width=True,
+                    )
+                    selection_key = page_selection_key(
+                        output,
+                        output_index,
+                        item["page"],
+                    )
+                    if st.button(
+                        f"Restore page {item['page']}",
+                        icon=":material/undo:",
+                        key=f"restore_{selection_key}",
+                        use_container_width=True,
+                    ):
+                        st.session_state[selection_key] = True
+                        st.rerun()
 
 
 def create_batch_zip(outputs: list[dict]) -> bytes:
@@ -885,7 +927,7 @@ st.markdown(
     </div>
     <div class="workflow-note" aria-label="Conversion steps">
         <span><strong>1.</strong> Select one or more PDFs</span>
-        <span><strong>2.</strong> Review and remove unwanted pages</span>
+        <span><strong>2.</strong> Delete unwanted images</span>
         <span><strong>3.</strong> Download or sync the pages you keep</span>
     </div>
     """,
@@ -897,7 +939,7 @@ st.caption("Select multiple files in one go. Each PDF is processed independently
 st.info(
     "**Every page is converted.** Pages with a Research Analyst or Investment "
     "Advisor are named `Title by Manager`; all other pages use their detected "
-    "page title. After conversion, uncheck any pages you do not want."
+    "page title. After conversion, use the bin button to remove images you do not want."
 )
 uploaded_files = st.file_uploader(
     "Choose PDF files",
