@@ -5,10 +5,15 @@ A simple Streamlit web app that:
 - converts every page from every PDF into a PNG image
 - names pages with a Research Analyst or Investment Advisor in the format
   `<title> by <manager name>`
+- supports the newer one-pager layout by reading the smallcase name from the
+  upper-left panel and the legal manager company below the lower-right SEBI area
+- removes `Private Limited`, `Private Ltd`, and `Pvt Ltd` from manager names
 - names pages without a manager label using the detected page title
 - gives every image a bin button so unwanted pages can be removed before
   download or sync, with a restore option for accidental removal
 - loads six lightweight review thumbnails at a time to keep large PDFs responsive
+- stores full-resolution PNGs and generated ZIPs on Streamlit's temporary disk
+  instead of retaining them in session memory
 - creates a separate ZIP download for every uploaded PDF
 - creates one master ZIP containing all successful per-PDF ZIP files
 - reports total, kept, and removed page counts for each PDF

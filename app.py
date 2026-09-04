@@ -1,9 +1,10 @@
 from pathlib import Path
 from datetime import datetime
 import re
-import io
 import zipfile
 import time
+import tempfile
+import shutil
 
 import fitz  # PyMuPDF
 import streamlit as st
@@ -235,6 +236,16 @@ def safe_name(name: str) -> str:
     return name[:120] if name else 'page'
 
 
+def cleanup_batch_temp_dir(path_value: str | None):
+    """Remove only a temp directory created by this app."""
+    if not path_value:
+        return
+    path = Path(path_value).resolve()
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    if path.parent == temp_root and path.name.startswith("pdf_export_"):
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def get_page_title(page: fitz.Page) -> str:
     data = page.get_text("dict")
     best_span = None
@@ -256,6 +267,110 @@ def get_page_title(page: fitz.Page) -> str:
                     if size > best_size + 0.5 or (abs(size - best_size) < 0.5 and y0 < best_y):
                         best_span = (text, size, y0)
     return best_span[0] if best_span else ""
+
+
+LEGAL_ENTITY_SUFFIX = (
+    r"(?:Private\s+(?:Limited|Ltd\.?)|Pvt\.?\s+Ltd\.?|"
+    r"Limited|Ltd\.?|LLP|L\.L\.P\.?)"
+)
+
+
+def extract_legal_entity_name(text: str) -> str:
+    """Extract a company name ending in a common Indian legal suffix."""
+    normalized = re.sub(r"\s+", " ", text).strip()
+    match = re.match(
+        rf"^([A-Z][A-Za-z0-9&'().,\-]*(?:\s+[A-Za-z0-9&'().,\-]+){{0,10}}?"
+        rf"\s+{LEGAL_ENTITY_SUFFIX})(?=\s|,|$)",
+        normalized,
+        re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    manager_name = match.group(1).strip().rstrip(".,")
+    manager_name = re.sub(
+        r"\s+(?:Private\s+(?:Limited|Ltd\.?)|Pvt\.?\s+Ltd\.?)$",
+        "",
+        manager_name,
+        flags=re.IGNORECASE,
+    )
+    return manager_name.strip().rstrip(".,")
+
+
+def get_lower_right_legal_manager(page: fitz.Page) -> str:
+    """Find the legal manager name beneath the SEBI area in the new layout."""
+    width = page.rect.width
+    height = page.rect.height
+    candidate_blocks = []
+
+    for block in page.get_text("blocks", sort=True):
+        x0, y0, _x1, _y1, text = block[:5]
+        if x0 < width * 0.32 or y0 < height * 0.62 or y0 > height * 0.95:
+            continue
+        candidate_blocks.append((y0, text))
+
+    for _y0, text in sorted(candidate_blocks):
+        # The company description normally starts with the legal entity name.
+        for line in text.splitlines():
+            manager = extract_legal_entity_name(line)
+            if manager:
+                return manager
+        manager = extract_legal_entity_name(text)
+        if manager:
+            return manager
+
+    return ""
+
+
+def get_upper_left_title(page: fitz.Page) -> str:
+    """Read the prominent multi-line smallcase title in the new left panel."""
+    width = page.rect.width
+    height = page.rect.height
+    candidate_blocks = []
+
+    for block in page.get_text("dict").get("blocks", []):
+        lines = block.get("lines", [])
+        if not lines:
+            continue
+        x0, y0, x1, y1 = block.get("bbox", (0, 0, 0, 0))
+        if x0 > width * 0.38 or x1 > width * 0.48:
+            continue
+        if y0 < height * 0.12 or y0 > height * 0.38:
+            continue
+
+        line_values = []
+        max_size = 0.0
+        for line in lines:
+            line_text = " ".join(
+                span.get("text", "").strip()
+                for span in line.get("spans", [])
+                if span.get("text", "").strip()
+            )
+            if not line_text:
+                continue
+            line_size = max(
+                (span.get("size", 0.0) for span in line.get("spans", [])),
+                default=0.0,
+            )
+            max_size = max(max_size, line_size)
+            line_values.append((line_text, line_size))
+
+        if line_values:
+            candidate_blocks.append((max_size, y0, line_values))
+
+    if not candidate_blocks:
+        return ""
+
+    _max_size, _y0, best_lines = max(
+        candidate_blocks,
+        key=lambda candidate: (candidate[0], -candidate[1]),
+    )
+    prominent_size = max(size for _text, size in best_lines)
+    title_lines = [
+        text
+        for text, size in best_lines
+        if size >= max(10.0, prominent_size * 0.78)
+    ]
+    return " ".join(title_lines).strip()
 
 
 def get_manager_name(page: fitz.Page) -> str:
@@ -290,19 +405,27 @@ def get_manager_name(page: fitz.Page) -> str:
 def convert_pdf_bytes(
     pdf_bytes: bytes,
     original_name: str,
+    output_dir: Path,
     zoom: float = 2.0,
     progress_callback=None,
 ):
-    """Render every page directly to memory without temporary disk writes."""
+    """Render every page to temporary disk to keep Streamlit memory bounded."""
     results = []
     used_filenames = {}
     pdf_stem = safe_name(Path(original_name).stem)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    thumbnail_dir = output_dir / "thumbnails"
+    thumbnail_dir.mkdir(parents=True, exist_ok=True)
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
         total_pages = len(doc)
         for i, page in enumerate(doc, start=1):
-            manager_raw = get_manager_name(page)
-            title_raw = get_page_title(page) or f"Page {i:03d}"
+            legal_manager = get_lower_right_legal_manager(page)
+            manager_raw = legal_manager or get_manager_name(page)
+            title_raw = (
+                get_upper_left_title(page) if legal_manager else get_page_title(page)
+            )
+            title_raw = title_raw or get_page_title(page) or f"Page {i:03d}"
             display_name = (
                 f"{title_raw} by {manager_raw}" if manager_raw else title_raw
             )
@@ -318,33 +441,30 @@ def convert_pdf_bytes(
             )
 
             pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-            image_bytes = pix.tobytes("png")
+            image_path = output_dir / filename
+            pix.save(str(image_path))
             del pix
             thumbnail_pix = page.get_pixmap(
                 matrix=fitz.Matrix(0.45, 0.45),
                 alpha=False,
             )
-            thumbnail_bytes = thumbnail_pix.tobytes("png")
+            thumbnail_path = thumbnail_dir / filename
+            thumbnail_pix.save(str(thumbnail_path))
             del thumbnail_pix
             results.append({
                 "page": i,
                 "title": title,
                 "folder": pdf_stem,
                 "filename": filename,
-                "image_bytes": image_bytes,
-                "thumbnail_bytes": thumbnail_bytes,
+                "image_path": str(image_path),
+                "thumbnail_path": str(thumbnail_path),
             })
             if progress_callback is not None:
                 progress_callback(i, total_pages)
     finally:
         doc.close()
 
-    preview_images = [
-        (item["filename"], item["image_bytes"]) for item in results[:5]
-    ]
-    # The selected-page ZIP is built once below after conversion. Avoiding an
-    # extra all-page ZIP here saves substantial time and memory for large PDFs.
-    return total_pages, results, b"", preview_images
+    return total_pages, results
 
 
 def format_file_size(size_bytes: int) -> str:
@@ -357,17 +477,21 @@ def output_zip_name(original_name: str) -> str:
     return f"{safe_name(Path(original_name).stem)}_images.zip"
 
 
-def build_output_zip(output: dict, results: list[dict]) -> bytes:
-    """Build a per-PDF ZIP from only the pages the user chose to keep."""
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_STORED) as archive:
+def build_output_zip(output: dict, results: list[dict]) -> str:
+    """Build or reuse a disk-backed ZIP containing the selected pages."""
+    signature = ",".join(str(item["page"]) for item in results)
+    zip_path = Path(output["working_dir"]) / "selected_images.zip"
+    if output.get("zip_signature") == signature and zip_path.exists():
+        return str(zip_path)
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as archive:
         for item in results:
-            archive.writestr(
+            archive.write(
+                item["image_path"],
                 f"{item['folder']}/{item['filename']}",
-                item["image_bytes"],
             )
-    zip_buffer.seek(0)
-    return zip_buffer.getvalue()
+    output["zip_signature"] = signature
+    return str(zip_path)
 
 
 def page_selection_key(output: dict, output_index: int, page: int) -> str:
@@ -388,12 +512,12 @@ def selected_output(output: dict, output_index: int) -> dict:
             True,
         )
     ]
+    zip_path = (
+        build_output_zip(output, kept_results) if kept_results else None
+    )
     filtered = dict(output)
     filtered["results"] = kept_results
-    filtered["zip_bytes"] = build_output_zip(output, kept_results)
-    filtered["previews"] = [
-        (item["filename"], item["image_bytes"]) for item in kept_results[:5]
-    ]
+    filtered["zip_path"] = zip_path
     return filtered
 
 
@@ -489,7 +613,7 @@ def render_page_review(output: dict, output_index: int):
                 image_slot = st.empty()
                 if st.session_state[selection_key]:
                     image_slot.image(
-                        item.get("thumbnail_bytes", item["image_bytes"]),
+                        item["thumbnail_path"],
                         caption=f"Page {item['page']} · {item['filename']}",
                         use_container_width=True,
                     )
@@ -519,14 +643,23 @@ def render_page_review(output: dict, output_index: int):
                         st.rerun()
 
 
-def create_batch_zip(outputs: list[dict]) -> bytes:
-    """Bundle each successful per-PDF ZIP into one download archive."""
-    batch_buffer = io.BytesIO()
+def create_batch_zip(outputs: list[dict]) -> str:
+    """Bundle disk-backed per-PDF ZIPs without loading them into memory."""
+    batch_dir = Path(outputs[0]["working_dir"]).parent
+    batch_path = batch_dir / "all_pdf_image_zips.zip"
+    signature = "|".join(
+        f"{output['original_name']}:{output.get('zip_signature', '')}"
+        for output in outputs
+    )
+    cache_key = f"batch_zip_signature_{outputs[0].get('batch_id', 'current')}"
+    if st.session_state.get(cache_key) == signature and batch_path.exists():
+        return str(batch_path)
+
     used_names = {}
 
     # The inner files are already compressed ZIPs, so storing them directly
     # avoids wasting time trying to compress the same bytes again.
-    with zipfile.ZipFile(batch_buffer, "w", zipfile.ZIP_STORED) as archive:
+    with zipfile.ZipFile(batch_path, "w", zipfile.ZIP_STORED) as archive:
         for output in outputs:
             if output["error"] is not None or not output["results"]:
                 continue
@@ -540,10 +673,10 @@ def create_batch_zip(outputs: list[dict]) -> bytes:
                 zip_path = Path(base_name)
                 archive_name = f"{zip_path.stem} ({occurrence}){zip_path.suffix}"
 
-            archive.writestr(archive_name, output["zip_bytes"])
+            archive.write(output["zip_path"], archive_name)
 
-    batch_buffer.seek(0)
-    return batch_buffer.getvalue()
+    st.session_state[cache_key] = signature
+    return str(batch_path)
 
 
 def get_google_drive_config():
@@ -583,8 +716,8 @@ def build_drive_service(token: dict, config):
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
 
-def collect_converted_pngs(outputs: list[dict]) -> list[tuple[str, bytes]]:
-    """Reference selected PNGs directly without reopening and copying ZIP data."""
+def collect_converted_pngs(outputs: list[dict]) -> list[tuple[str, str]]:
+    """Return selected PNG names and disk paths without copying file data."""
     images = []
     used_names = {}
 
@@ -603,7 +736,7 @@ def collect_converted_pngs(outputs: list[dict]) -> list[tuple[str, bytes]]:
                 image_name = (
                     f"{image_path.stem} ({occurrence}){image_path.suffix}"
                 )
-            images.append((image_name, item["image_bytes"]))
+            images.append((image_name, item["image_path"]))
 
     return images
 
@@ -675,9 +808,9 @@ def is_replaceable_drive_image(item: dict) -> bool:
     ).suffix.casefold() in {".png", ".jpg", ".jpeg"}
 
 
-def replace_drive_folder(service, folder_id: str, images: list[tuple[str, bytes]]):
+def replace_drive_folder(service, folder_id: str, images: list[tuple[str, str]]):
     """Replace direct PNG/JPG files, with best-effort rollback on error."""
-    from googleapiclient.http import MediaIoBaseUpload
+    from googleapiclient.http import MediaFileUpload
 
     folder = service.files().get(
         fileId=folder_id,
@@ -707,9 +840,9 @@ def replace_drive_folder(service, folder_id: str, images: list[tuple[str, bytes]
     trashed_ids = []
     try:
         # Upload first. If an upload fails, the old folder remains unchanged.
-        for image_name, image_bytes in images:
-            media = MediaIoBaseUpload(
-                io.BytesIO(image_bytes),
+        for image_name, image_path in images:
+            media = MediaFileUpload(
+                image_path,
                 mimetype="image/png",
                 resumable=False,
             )
@@ -971,9 +1104,10 @@ st.markdown(
 st.subheader("Upload PDFs")
 st.caption("Select multiple files in one go. Each PDF is processed independently.")
 st.info(
-    "**Every page is converted.** Pages with a Research Analyst or Investment "
-    "Advisor are named `Title by Manager`; all other pages use their detected "
-    "page title. After conversion, use the bin button to remove images you do not want."
+    "**Every page is converted.** The app supports both one-pager layouts and "
+    "names portfolio pages `Smallcase by Manager`; all other pages use their "
+    "detected page title. After conversion, use the bin button to remove images "
+    "you do not want."
 )
 uploaded_files = st.file_uploader(
     "Choose PDF files",
@@ -1022,13 +1156,19 @@ if "conversion_outputs" not in st.session_state:
     st.session_state.conversion_outputs = []
 elif any(
     output.get("results")
-    and "image_bytes" not in output["results"][0]
+    and "image_path" not in output["results"][0]
     for output in st.session_state.conversion_outputs
 ):
-    # Results created by an older app version cannot support page review.
+    # Results created by an older in-memory app version cannot be reused.
+    cleanup_batch_temp_dir(st.session_state.get("batch_temp_dir"))
+    st.session_state.pop("batch_temp_dir", None)
     st.session_state.conversion_outputs = []
 
 if process and uploaded_files:
+    cleanup_batch_temp_dir(st.session_state.get("batch_temp_dir"))
+    batch_temp_dir = tempfile.mkdtemp(prefix="pdf_export_")
+    st.session_state.batch_temp_dir = batch_temp_dir
+    batch_root = Path(batch_temp_dir)
     batch_outputs = []
     batch_id = time.time_ns()
     progress_bar = st.progress(0)
@@ -1036,6 +1176,7 @@ if process and uploaded_files:
 
     for index, uploaded in enumerate(uploaded_files, start=1):
         progress_text.caption(f"Opening {index} of {file_count}: {uploaded.name}")
+        working_dir = batch_root / f"{index}_{safe_name(Path(uploaded.name).stem)}"
 
         def update_page_progress(page_number, total_pages):
             overall_progress = (
@@ -1048,9 +1189,10 @@ if process and uploaded_files:
             )
 
         try:
-            total_pages, results, zip_bytes, previews = convert_pdf_bytes(
+            total_pages, results = convert_pdf_bytes(
                 uploaded.getvalue(),
                 uploaded.name,
+                working_dir,
                 zoom=zoom,
                 progress_callback=update_page_progress,
             )
@@ -1059,8 +1201,8 @@ if process and uploaded_files:
                 "original_name": uploaded.name,
                 "total_pages": total_pages,
                 "results": results,
-                "zip_bytes": zip_bytes,
-                "previews": previews,
+                "working_dir": str(working_dir),
+                "zip_signature": None,
                 "error": None,
             })
         except Exception as exc:
@@ -1069,8 +1211,8 @@ if process and uploaded_files:
                 "original_name": uploaded.name,
                 "total_pages": 0,
                 "results": [],
-                "zip_bytes": b"",
-                "previews": [],
+                "working_dir": str(working_dir),
+                "zip_signature": None,
                 "error": str(exc),
             })
         progress_bar.progress(index / file_count)
@@ -1117,15 +1259,16 @@ if st.session_state.conversion_outputs:
             )
     with batch_download_col:
         if len(downloadable_outputs) > 1:
-            batch_zip_bytes = create_batch_zip(downloadable_outputs)
-            st.download_button(
-                label=f"Download all {len(downloadable_outputs)} ZIPs",
-                data=batch_zip_bytes,
-                file_name="all_pdf_image_zips.zip",
-                mime="application/zip",
-                key="download_all_zips",
-                use_container_width=True,
-            )
+            batch_zip_path = create_batch_zip(downloadable_outputs)
+            with open(batch_zip_path, "rb") as batch_zip_file:
+                st.download_button(
+                    label=f"Download all {len(downloadable_outputs)} ZIPs",
+                    data=batch_zip_file,
+                    file_name="all_pdf_image_zips.zip",
+                    mime="application/zip",
+                    key="download_all_zips",
+                    use_container_width=True,
+                )
 
     for output_index, (source_output, output) in enumerate(
         zip(st.session_state.conversion_outputs, selected_conversion_outputs)
@@ -1156,14 +1299,15 @@ if st.session_state.conversion_outputs:
             with download_col:
                 zip_name = output_zip_name(output["original_name"])
                 if converted_count:
-                    st.download_button(
-                        label="Download ZIP",
-                        data=output["zip_bytes"],
-                        file_name=zip_name,
-                        mime="application/zip",
-                        key=f"download_{output_index}_{zip_name}",
-                        use_container_width=True,
-                    )
+                    with open(output["zip_path"], "rb") as zip_file:
+                        st.download_button(
+                            label="Download ZIP",
+                            data=zip_file,
+                            file_name=zip_name,
+                            mime="application/zip",
+                            key=f"download_{output_index}_{zip_name}",
+                            use_container_width=True,
+                        )
             with drive_col:
                 if converted_count:
                     render_report_drive_sync(
