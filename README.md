@@ -8,6 +8,7 @@ A simple Streamlit web app that:
 - names pages without a manager label using the detected page title
 - gives every image a bin button so unwanted pages can be removed before
   download or sync, with a restore option for accidental removal
+- loads six lightweight review thumbnails at a time to keep large PDFs responsive
 - creates a separate ZIP download for every uploaded PDF
 - creates one master ZIP containing all successful per-PDF ZIP files
 - reports total, kept, and removed page counts for each PDF

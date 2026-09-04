@@ -3,7 +3,6 @@ from datetime import datetime
 import re
 import io
 import zipfile
-import tempfile
 import time
 
 import fitz  # PyMuPDF
@@ -184,6 +183,23 @@ st.markdown(
             border-radius: 0.65rem;
         }
         div[data-testid="stImage"] img { border-radius: 0.55rem; }
+        .removed-image-slot {
+            display: grid;
+            place-items: center;
+            width: 100%;
+            min-height: 11rem;
+            aspect-ratio: 0.707;
+            border: 1px dashed var(--line);
+            border-radius: 0.55rem;
+            background: var(--surface-subtle);
+            color: var(--muted);
+            text-align: center;
+        }
+        .removed-image-slot strong {
+            display: block;
+            margin-bottom: 0.25rem;
+            color: var(--ink);
+        }
         .result-meta { color: var(--muted); font-size: 0.9rem; }
         .result-counts {
             display: flex;
@@ -217,20 +233,6 @@ def safe_name(name: str) -> str:
     name = re.sub(r'[\\/:*?"<>|]+', '_', name)
     name = re.sub(r'\s+', ' ', name).strip()
     return name[:120] if name else 'page'
-
-
-def unique_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-    stem = path.stem
-    suffix = path.suffix
-    parent = path.parent
-    counter = 2
-    while True:
-        candidate = parent / f"{stem} ({counter}){suffix}"
-        if not candidate.exists():
-            return candidate
-        counter += 1
 
 
 def get_page_title(page: fitz.Page) -> str:
@@ -285,15 +287,18 @@ def get_manager_name(page: fitz.Page) -> str:
     return ""
 
 
-def convert_pdf_bytes(pdf_bytes: bytes, original_name: str, zoom: float = 2.0):
+def convert_pdf_bytes(
+    pdf_bytes: bytes,
+    original_name: str,
+    zoom: float = 2.0,
+    progress_callback=None,
+):
+    """Render every page directly to memory without temporary disk writes."""
     results = []
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = Path(tmpdir)
-        pdf_stem = safe_name(Path(original_name).stem)
-        out_dir = tmp_path / pdf_stem
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    used_filenames = {}
+    pdf_stem = safe_name(Path(original_name).stem)
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
         total_pages = len(doc)
         for i, page in enumerate(doc, start=1):
             manager_raw = get_manager_name(page)
@@ -302,31 +307,44 @@ def convert_pdf_bytes(pdf_bytes: bytes, original_name: str, zoom: float = 2.0):
                 f"{title_raw} by {manager_raw}" if manager_raw else title_raw
             )
             title = safe_name(display_name)
-            image_path = unique_path(out_dir / f"{title}.png")
+            base_filename = f"{title}.png"
+            filename_key = base_filename.casefold()
+            used_filenames[filename_key] = used_filenames.get(filename_key, 0) + 1
+            occurrence = used_filenames[filename_key]
+            filename = (
+                base_filename
+                if occurrence == 1
+                else f"{title} ({occurrence}).png"
+            )
+
             pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
-            pix.save(str(image_path))
-            image_bytes = image_path.read_bytes()
+            image_bytes = pix.tobytes("png")
+            del pix
+            thumbnail_pix = page.get_pixmap(
+                matrix=fitz.Matrix(0.45, 0.45),
+                alpha=False,
+            )
+            thumbnail_bytes = thumbnail_pix.tobytes("png")
+            del thumbnail_pix
             results.append({
                 "page": i,
                 "title": title,
                 "folder": pdf_stem,
-                "filename": image_path.name,
+                "filename": filename,
                 "image_bytes": image_bytes,
+                "thumbnail_bytes": thumbnail_bytes,
             })
+            if progress_callback is not None:
+                progress_callback(i, total_pages)
+    finally:
         doc.close()
 
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for item in results:
-                arcname = f"{item['folder']}/{item['filename']}"
-                zf.writestr(arcname, item["image_bytes"])
-        zip_buffer.seek(0)
-
-        preview_images = []
-        for item in results[:5]:
-            preview_images.append((item["filename"], item["image_bytes"]))
-
-        return total_pages, results, zip_buffer.getvalue(), preview_images
+    preview_images = [
+        (item["filename"], item["image_bytes"]) for item in results[:5]
+    ]
+    # The selected-page ZIP is built once below after conversion. Avoiding an
+    # extra all-page ZIP here saves substantial time and memory for large PDFs.
+    return total_pages, results, b"", preview_images
 
 
 def format_file_size(size_bytes: int) -> str:
@@ -394,7 +412,7 @@ def render_page_review(output: dict, output_index: int):
 
     with st.expander(
         f"Review images — {len(kept_items)} of {len(output['results'])} kept",
-        expanded=True,
+        expanded=False,
     ):
         st.caption(
             "Use the bin button to remove an image. Downloads and Drive sync "
@@ -428,48 +446,68 @@ def render_page_review(output: dict, output_index: int):
 
         if not kept_items:
             st.info(
-                "No images are currently selected. Restore an image below to "
+                "No images are currently selected. Restore an image to "
                 "enable download and Drive sync."
             )
 
+        page_size = 6
+        page_group_count = max(
+            1,
+            (len(output["results"]) + page_size - 1) // page_size,
+        )
+        if page_group_count > 1:
+            page_group = st.selectbox(
+                "Images to review",
+                options=list(range(page_group_count)),
+                format_func=lambda group: (
+                    f"Pages {group * page_size + 1}–"
+                    f"{min((group + 1) * page_size, len(output['results']))}"
+                ),
+                key=(
+                    f"review_group_{output.get('batch_id', 'current')}_"
+                    f"{output_index}"
+                ),
+            )
+        else:
+            page_group = 0
+
+        visible_items = output["results"][
+            page_group * page_size:(page_group + 1) * page_size
+        ]
+
+        # Render every visible page in its original grid position. Keeping stable
+        # element positions prevents Streamlit from reusing a deleted page's
+        # thumbnail for the next page during reruns.
         review_columns = st.columns(3)
-        for item_index, item in enumerate(kept_items):
+        for item_index, item in enumerate(visible_items):
             with review_columns[item_index % len(review_columns)]:
-                st.image(
-                    item["image_bytes"],
-                    caption=f"Page {item['page']} · {item['filename']}",
-                    use_container_width=True,
-                )
                 selection_key = page_selection_key(
                     output,
                     output_index,
                     item["page"],
                 )
-                if st.button(
-                    f"Delete page {item['page']}",
-                    icon=":material/delete:",
-                    key=f"delete_{selection_key}",
-                    use_container_width=True,
-                ):
-                    st.session_state[selection_key] = False
-                    st.rerun()
-
-        if removed_items:
-            st.divider()
-            st.markdown(f"**Removed images ({len(removed_items)})**")
-            st.caption("Removed images are excluded from download and Drive sync.")
-            removed_columns = st.columns(3)
-            for item_index, item in enumerate(removed_items):
-                with removed_columns[item_index % len(removed_columns)]:
-                    st.image(
-                        item["image_bytes"],
+                image_slot = st.empty()
+                if st.session_state[selection_key]:
+                    image_slot.image(
+                        item.get("thumbnail_bytes", item["image_bytes"]),
                         caption=f"Page {item['page']} · {item['filename']}",
                         use_container_width=True,
                     )
-                    selection_key = page_selection_key(
-                        output,
-                        output_index,
-                        item["page"],
+                    if st.button(
+                        f"Delete page {item['page']}",
+                        icon=":material/delete:",
+                        key=f"delete_{selection_key}",
+                        use_container_width=True,
+                    ):
+                        st.session_state[selection_key] = False
+                        st.rerun()
+                else:
+                    image_slot.markdown(
+                        '<div class="removed-image-slot">'
+                        '<div><strong>Image removed</strong>'
+                        f'<span>Page {item["page"]} is excluded from output</span></div>'
+                        '</div>',
+                        unsafe_allow_html=True,
                     )
                     if st.button(
                         f"Restore page {item['page']}",
@@ -546,30 +584,26 @@ def build_drive_service(token: dict, config):
 
 
 def collect_converted_pngs(outputs: list[dict]) -> list[tuple[str, bytes]]:
-    """Flatten the latest successful conversions into unique PNG filenames."""
+    """Reference selected PNGs directly without reopening and copying ZIP data."""
     images = []
     used_names = {}
 
     for output in outputs:
         if output["error"] is not None or not output["results"]:
             continue
-        with zipfile.ZipFile(io.BytesIO(output["zip_bytes"])) as archive:
-            for member in archive.infolist():
-                if member.is_dir() or not member.filename.lower().endswith(".png"):
-                    continue
-
-                base_name = Path(member.filename).name
-                name_key = base_name.casefold()
-                used_names[name_key] = used_names.get(name_key, 0) + 1
-                occurrence = used_names[name_key]
-                if occurrence == 1:
-                    image_name = base_name
-                else:
-                    image_path = Path(base_name)
-                    image_name = (
-                        f"{image_path.stem} ({occurrence}){image_path.suffix}"
-                    )
-                images.append((image_name, archive.read(member)))
+        for item in output["results"]:
+            base_name = Path(item["filename"]).name
+            name_key = base_name.casefold()
+            used_names[name_key] = used_names.get(name_key, 0) + 1
+            occurrence = used_names[name_key]
+            if occurrence == 1:
+                image_name = base_name
+            else:
+                image_path = Path(base_name)
+                image_name = (
+                    f"{image_path.stem} ({occurrence}){image_path.suffix}"
+                )
+            images.append((image_name, item["image_bytes"]))
 
     return images
 
@@ -954,7 +988,7 @@ with control_col:
     zoom = st.select_slider(
         "Image resolution",
         options=[1.0, 1.5, 2.0, 2.5, 3.0],
-        value=2.0,
+        value=1.5,
         format_func=lambda value: {
             1.0: "Standard",
             1.5: "Balanced",
@@ -962,7 +996,10 @@ with control_col:
             2.5: "Very high",
             3.0: "Maximum",
         }[value],
-        help="Higher resolution creates sharper PNGs and larger ZIP files.",
+        help=(
+            "Balanced is recommended for speed. Higher resolutions create "
+            "sharper PNGs but take longer and use substantially more memory."
+        ),
     )
 
 file_count = len(uploaded_files) if uploaded_files else 0
@@ -998,12 +1035,24 @@ if process and uploaded_files:
     progress_text = st.empty()
 
     for index, uploaded in enumerate(uploaded_files, start=1):
-        progress_text.caption(f"Processing {index} of {file_count}: {uploaded.name}")
+        progress_text.caption(f"Opening {index} of {file_count}: {uploaded.name}")
+
+        def update_page_progress(page_number, total_pages):
+            overall_progress = (
+                (index - 1) + (page_number / max(total_pages, 1))
+            ) / file_count
+            progress_bar.progress(min(overall_progress, 1.0))
+            progress_text.caption(
+                f"Processing {index} of {file_count}: {uploaded.name} — "
+                f"page {page_number} of {total_pages}"
+            )
+
         try:
             total_pages, results, zip_bytes, previews = convert_pdf_bytes(
                 uploaded.getvalue(),
                 uploaded.name,
                 zoom=zoom,
+                progress_callback=update_page_progress,
             )
             batch_outputs.append({
                 "batch_id": batch_id,
@@ -1067,7 +1116,7 @@ if st.session_state.conversion_outputs:
                 f"{len(st.session_state.conversion_outputs)} PDF files."
             )
     with batch_download_col:
-        if downloadable_outputs:
+        if len(downloadable_outputs) > 1:
             batch_zip_bytes = create_batch_zip(downloadable_outputs)
             st.download_button(
                 label=f"Download all {len(downloadable_outputs)} ZIPs",
