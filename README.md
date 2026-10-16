@@ -7,20 +7,31 @@ A simple Streamlit web app that:
   `<title> by <manager name>`
 - supports the newer one-pager layout by reading the smallcase name from the
   upper-left panel and the legal manager company below the lower-right SEBI area
+- OCRs only small high-contrast title and manager regions when a PDF page has
+  no searchable text, with one OCR CPU thread and a per-region timeout
 - removes `Private Limited`, `Private Ltd`, and `Pvt Ltd` from manager names
 - names pages without a manager label using the detected page title
 - gives every image a bin button so unwanted pages can be removed before
   download or sync, with a restore option for accidental removal
-- loads six lightweight review thumbnails at a time to keep large PDFs responsive
+- provides an editable filename below every retained thumbnail for quick manual
+  correction before download or Drive sync
+- loads six 280-pixel review thumbnails at a time to keep large PDFs responsive
 - stores full-resolution PNGs and generated ZIPs on Streamlit's temporary disk
   instead of retaining them in session memory
-- creates a separate ZIP download for every uploaded PDF
+- creates a separate ZIP download for every uploaded PDF, containing the
+  original PDF alongside the retained PNG pages
 - creates one master ZIP containing all successful per-PDF ZIP files
+- loads only the ZIP selected in the download menu instead of preloading every
+  individual ZIP and the master ZIP into Streamlit memory
 - reports total, kept, and removed page counts for each PDF
-- optionally connects to Google Drive and replaces the PNG/JPG files in a
-  selected broker subfolder with one report's freshly converted PNGs
+- optionally connects to Google Drive and replaces the PDF/PNG/JPG files in a
+  selected broker subfolder with one report's original PDF and retained PNGs
 
 ## Setup
+
+The app needs both the Python packages in `requirements.txt` and the Tesseract
+system package in `packages.txt`. Streamlit Community Cloud installs both files
+automatically when they are committed at the repository root.
 
 ```bash
 cd /path/to/pdf_to_image-main
@@ -46,10 +57,10 @@ Drive sync appears on the main screen with the conversion results. Connect a
 Google account once, then use the **Sync to Drive** action beside each report.
 The app lists the immediate broker subfolders inside the configured root Drive
 folder. Select Axis, SBI, HDFC, or another listed subfolder for that report.
-All PNG/JPG/JPEG files directly inside the selected broker folder are moved to
-Google Drive Trash and replaced by that report's currently selected PNGs.
-Images removed in the review area are not synced. Non-image files and nested
-folders are preserved.
+All PDF/PNG/JPG/JPEG files directly inside the selected broker folder are moved
+to Google Drive Trash and replaced by that report's original PDF and currently
+selected PNGs. Images removed in the review area are not synced. Other file
+types and nested folders are preserved.
 
 ### Google Cloud setup
 

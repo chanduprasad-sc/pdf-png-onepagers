@@ -1,5 +1,7 @@
 from pathlib import Path
 from datetime import datetime
+import gc
+import os
 import re
 import zipfile
 import time
@@ -8,6 +10,9 @@ import shutil
 
 import fitz  # PyMuPDF
 import streamlit as st
+
+# Keep each Tesseract subprocess small enough for Streamlit Community Cloud.
+os.environ.setdefault("OMP_THREAD_LIMIT", "1")
 
 GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
 GOOGLE_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -18,6 +23,7 @@ DRIVE_ROOT_FOLDER_URL = (
     "https://drive.google.com/drive/folders/"
     f"{DRIVE_ROOT_FOLDER_ID}"
 )
+APP_STATE_VERSION = 3
 
 st.set_page_config(
     page_title="PDF Page Exporter",
@@ -33,29 +39,36 @@ st.markdown(
             --app-bg: oklch(0.975 0 0);
             --surface: oklch(1 0 0);
             --surface-subtle: oklch(0.955 0.008 140);
+            --surface-raised: oklch(0.99 0.004 140);
             --ink: oklch(0.19 0.025 140);
             --muted: oklch(0.46 0.02 140);
             --line: oklch(0.88 0.012 140);
+            --line-strong: oklch(0.78 0.025 140);
             --primary: oklch(0.35 0.11 140);
             --primary-hover: oklch(0.30 0.105 140);
             --accent: oklch(0.58 0.13 235);
             --focus: var(--accent);
+            --radius-sm: 0.65rem;
+            --radius-md: 0.9rem;
+            --shadow-sm: 0 0.3rem 1.1rem oklch(0.19 0.025 140 / 0.055);
         }
 
         html { color-scheme: light; }
         .stApp { background: var(--app-bg); color: var(--ink); }
         .block-container {
             max-width: 1080px;
-            padding-top: 3.5rem;
+            padding-top: 3rem;
             padding-bottom: 5rem;
         }
         header[data-testid="stHeader"] { background: transparent; }
 
         .app-hero {
             display: flex;
-            align-items: center;
-            gap: 1rem;
-            margin-bottom: 2.5rem;
+            align-items: flex-start;
+            gap: 1.15rem;
+            margin-bottom: 1.5rem;
+            padding-bottom: 1.5rem;
+            border-bottom: 1px solid var(--line);
         }
         .app-mark {
             display: grid;
@@ -63,14 +76,15 @@ st.markdown(
             width: 3.25rem;
             height: 3.25rem;
             flex: 0 0 auto;
-            border-radius: 0.8rem;
+            border-radius: var(--radius-md);
             background: var(--primary);
             color: oklch(1 0 0);
             font-size: 0.72rem;
             font-weight: 750;
             letter-spacing: 0.04em;
-            box-shadow: 0 0.5rem 1.5rem oklch(0.35 0.11 140 / 0.18);
+            box-shadow: 0 0.5rem 1.5rem oklch(0.35 0.11 140 / 0.16);
         }
+        .app-hero-copy { flex: 1; min-width: 0; }
         .app-hero h1 {
             margin: 0 0 0.25rem;
             color: var(--ink);
@@ -87,29 +101,80 @@ st.markdown(
             line-height: 1.55;
             text-wrap: pretty;
         }
+        .hero-meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.45rem;
+            margin-top: 0.8rem;
+        }
+        .hero-meta span {
+            display: inline-flex;
+            align-items: center;
+            min-height: 1.8rem;
+            padding: 0.25rem 0.65rem;
+            border: 1px solid var(--line);
+            border-radius: 999px;
+            background: var(--surface);
+            color: var(--muted);
+            font-size: 0.78rem;
+            font-weight: 600;
+        }
         .workflow-note {
             display: flex;
             flex-wrap: wrap;
-            gap: 0.65rem 1.25rem;
-            margin: -1rem 0 2.25rem;
+            gap: 0.55rem;
+            margin: 0 0 2.35rem;
             color: var(--muted);
             font-size: 0.875rem;
         }
-        .workflow-note span { white-space: nowrap; }
-        .workflow-note strong { color: var(--ink); }
+        .workflow-note span {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.45rem;
+            min-height: 2.15rem;
+            padding: 0.35rem 0.7rem 0.35rem 0.4rem;
+            border-radius: 999px;
+            background: var(--surface-subtle);
+            white-space: nowrap;
+        }
+        .workflow-note strong {
+            display: grid;
+            place-items: center;
+            width: 1.45rem;
+            height: 1.45rem;
+            border-radius: 999px;
+            background: var(--surface);
+            color: var(--primary);
+            box-shadow: 0 0 0 1px var(--line);
+            font-size: 0.75rem;
+        }
+        .conversion-note {
+            margin: 0.75rem 0 1rem;
+            padding: 0.85rem 1rem;
+            border-left: 3px solid var(--primary);
+            border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+            background: var(--surface-subtle);
+            color: var(--muted);
+            font-size: 0.9rem;
+            line-height: 1.55;
+        }
+        .conversion-note strong { color: var(--ink); }
 
         h2, h3 { color: var(--ink); letter-spacing: -0.015em; }
         div[data-testid="stFileUploaderDropzone"] {
             min-height: 12rem;
             border: 1.5px dashed var(--line) !important;
-            border-radius: 0.9rem;
+            border-radius: var(--radius-md);
             background: var(--surface) !important;
             color: var(--ink) !important;
-            transition: border-color 180ms ease-out, background 180ms ease-out;
+            box-shadow: var(--shadow-sm);
+            transition: border-color 180ms ease-out, background 180ms ease-out,
+                        box-shadow 180ms ease-out;
         }
         div[data-testid="stFileUploaderDropzone"]:hover {
-            border-color: var(--focus) !important;
+            border-color: var(--primary) !important;
             background: var(--surface-subtle) !important;
+            box-shadow: 0 0 0 3px oklch(0.68 0.13 140 / 0.12);
         }
         div[data-testid="stFileUploaderDropzone"] button {
             border-color: var(--primary) !important;
@@ -134,7 +199,7 @@ st.markdown(
             color: var(--muted) !important;
         }
         div[data-testid="stFileUploaderFile"] {
-            border-radius: 0.65rem;
+            border-radius: var(--radius-sm);
             background: var(--surface) !important;
             color: var(--ink) !important;
         }
@@ -147,7 +212,7 @@ st.markdown(
         div[data-testid="stDownloadButton"] > button {
             min-height: 2.8rem;
             border: 1px solid var(--primary);
-            border-radius: 0.65rem;
+            border-radius: var(--radius-sm);
             background: var(--primary);
             color: oklch(1 0 0);
             font-weight: 650;
@@ -171,17 +236,46 @@ st.markdown(
             background: oklch(0.89 0.008 140);
             color: oklch(0.47 0.015 140);
         }
+        div[data-testid="stButton"] > button:not([kind="primary"]),
+        div[data-testid="stPopover"] > button {
+            min-height: 2.8rem;
+            border-color: var(--line-strong);
+            border-radius: var(--radius-sm);
+            background: var(--surface);
+            color: var(--ink);
+            transition: border-color 180ms ease-out, background 180ms ease-out,
+                        transform 180ms ease-out;
+        }
+        div[data-testid="stButton"] > button:not([kind="primary"]):hover,
+        div[data-testid="stPopover"] > button:hover {
+            border-color: var(--primary);
+            background: var(--surface-subtle);
+            color: var(--primary);
+            transform: translateY(-1px);
+        }
+        div[data-baseweb="select"] > div,
+        div[data-testid="stTextInput"] input {
+            border-radius: var(--radius-sm);
+            border-color: var(--line-strong);
+            background: var(--surface);
+        }
+        div[data-baseweb="select"] > div:focus-within,
+        div[data-testid="stTextInput"] input:focus {
+            border-color: var(--focus);
+            box-shadow: 0 0 0 3px oklch(0.58 0.13 235 / 0.16);
+        }
 
         div[data-testid="stVerticalBlockBorderWrapper"] {
             border-color: var(--line) !important;
-            border-radius: 0.9rem !important;
+            border-radius: var(--radius-md) !important;
             background: var(--surface);
-            box-shadow: 0 0.35rem 1.5rem oklch(0.19 0.025 140 / 0.045);
+            box-shadow: var(--shadow-sm);
         }
-        div[data-testid="stAlert"] { border-radius: 0.65rem; }
+        div[data-testid="stAlert"] { border-radius: var(--radius-sm); }
         div[data-testid="stExpander"] {
             border-color: var(--line);
-            border-radius: 0.65rem;
+            border-radius: var(--radius-sm);
+            overflow: hidden;
         }
         div[data-testid="stImage"] img { border-radius: 0.55rem; }
         .removed-image-slot {
@@ -205,18 +299,32 @@ st.markdown(
         .result-counts {
             display: flex;
             flex-wrap: wrap;
-            gap: 0.5rem 1.15rem;
+            gap: 0.5rem;
             margin-top: 0.65rem;
             color: var(--muted);
             font-size: 0.9rem;
         }
+        .result-counts span {
+            padding: 0.3rem 0.6rem;
+            border: 1px solid var(--line);
+            border-radius: 999px;
+            background: var(--surface-raised);
+        }
         .result-counts strong { color: var(--ink); font-weight: 700; }
+        .package-note {
+            margin: 0.6rem 0 0;
+            color: var(--muted);
+            font-size: 0.82rem;
+        }
+        .package-note strong { color: var(--primary); }
 
         @media (max-width: 640px) {
             .block-container { padding-top: 2rem; }
-            .app-hero { align-items: flex-start; }
+            .app-hero { gap: 0.8rem; }
             .app-hero h1 { font-size: 1.65rem; }
             .app-mark { width: 2.8rem; height: 2.8rem; }
+            .workflow-note { display: grid; }
+            .workflow-note span { white-space: normal; }
         }
         @media (prefers-reduced-motion: reduce) {
             *, *::before, *::after {
@@ -234,6 +342,12 @@ def safe_name(name: str) -> str:
     name = re.sub(r'[\\/:*?"<>|]+', '_', name)
     name = re.sub(r'\s+', ' ', name).strip()
     return name[:120] if name else 'page'
+
+
+def safe_pdf_name(original_name: str) -> str:
+    """Preserve the uploaded PDF name while keeping it filesystem-safe."""
+    stem = safe_name(Path(original_name).stem)[:112]
+    return f"{stem}.pdf"
 
 
 def cleanup_batch_temp_dir(path_value: str | None):
@@ -274,10 +388,23 @@ LEGAL_ENTITY_SUFFIX = (
     r"Limited|Ltd\.?|LLP|L\.L\.P\.?)"
 )
 
+OUTPUT_WIDTHS = {
+    1.0: 900,
+    1.5: 1200,
+    2.0: 1500,
+}
+
 
 def extract_legal_entity_name(text: str) -> str:
     """Extract a company name ending in a common Indian legal suffix."""
     normalized = re.sub(r"\s+", " ", text).strip()
+    normalized = re.sub(r"^[^A-Za-z0-9]+", "", normalized)
+    normalized = re.sub(
+        r"^(?:portfolio\s+manager|manager|managed\s+by)\s*[:\-]\s*",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
     match = re.match(
         rf"^([A-Z][A-Za-z0-9&'().,\-]*(?:\s+[A-Za-z0-9&'().,\-]+){{0,10}}?"
         rf"\s+{LEGAL_ENTITY_SUFFIX})(?=\s|,|$)",
@@ -304,7 +431,7 @@ def get_lower_right_legal_manager(page: fitz.Page) -> str:
 
     for block in page.get_text("blocks", sort=True):
         x0, y0, _x1, _y1, text = block[:5]
-        if x0 < width * 0.32 or y0 < height * 0.62 or y0 > height * 0.95:
+        if x0 < width * 0.22 or y0 < height * 0.55 or y0 > height * 0.96:
             continue
         candidate_blocks.append((y0, text))
 
@@ -325,52 +452,276 @@ def get_upper_left_title(page: fitz.Page) -> str:
     """Read the prominent multi-line smallcase title in the new left panel."""
     width = page.rect.width
     height = page.rect.height
-    candidate_blocks = []
+    candidate_lines = []
 
     for block in page.get_text("dict").get("blocks", []):
         lines = block.get("lines", [])
         if not lines:
             continue
-        x0, y0, x1, y1 = block.get("bbox", (0, 0, 0, 0))
-        if x0 > width * 0.38 or x1 > width * 0.48:
-            continue
-        if y0 < height * 0.12 or y0 > height * 0.38:
-            continue
-
-        line_values = []
-        max_size = 0.0
         for line in lines:
+            spans = line.get("spans", [])
             line_text = " ".join(
                 span.get("text", "").strip()
-                for span in line.get("spans", [])
+                for span in spans
                 if span.get("text", "").strip()
             )
             if not line_text:
                 continue
+            line_bbox = line.get("bbox")
+            if line_bbox is None and spans:
+                span_boxes = [
+                    span.get("bbox") for span in spans if span.get("bbox")
+                ]
+                if span_boxes:
+                    line_bbox = (
+                        min(box[0] for box in span_boxes),
+                        min(box[1] for box in span_boxes),
+                        max(box[2] for box in span_boxes),
+                        max(box[3] for box in span_boxes),
+                    )
+            if line_bbox is None:
+                continue
+
+            x0, y0, x1, y1 = line_bbox
+            if x0 > width * 0.38 or x1 > width * 0.52:
+                continue
+            if y0 < height * 0.12 or y0 > height * 0.42:
+                continue
             line_size = max(
-                (span.get("size", 0.0) for span in line.get("spans", [])),
+                (span.get("size", 0.0) for span in spans),
                 default=0.0,
             )
-            max_size = max(max_size, line_size)
-            line_values.append((line_text, line_size))
+            if line_size >= 12.0:
+                candidate_lines.append((y0, y1, line_size, line_text))
 
-        if line_values:
-            candidate_blocks.append((max_size, y0, line_values))
-
-    if not candidate_blocks:
+    if not candidate_lines:
         return ""
 
-    _max_size, _y0, best_lines = max(
-        candidate_blocks,
-        key=lambda candidate: (candidate[0], -candidate[1]),
+    clusters = []
+    for candidate in sorted(candidate_lines):
+        y0, _y1, size, _text = candidate
+        if not clusters:
+            clusters.append([candidate])
+            continue
+        previous = clusters[-1][-1]
+        max_gap = max(14.0, max(previous[2], size) * 1.25)
+        if y0 - previous[1] <= max_gap:
+            clusters[-1].append(candidate)
+        else:
+            clusters.append([candidate])
+
+    best_cluster = max(
+        clusters,
+        key=lambda cluster: (
+            len(cluster),
+            sum(item[2] for item in cluster) / len(cluster),
+            sum(len(item[3]) for item in cluster),
+            -cluster[0][0],
+        ),
     )
-    prominent_size = max(size for _text, size in best_lines)
-    title_lines = [
-        text
-        for text, size in best_lines
-        if size >= max(10.0, prominent_size * 0.78)
+    return " ".join(item[3] for item in best_cluster).strip()
+
+
+def pixmap_to_pil_image(pix):
+    """Convert a small OCR pixmap to a Pillow image."""
+    from PIL import Image
+
+    mode = "RGBA" if pix.alpha else "RGB"
+    return Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+
+
+def render_ocr_crop(page: fitz.Page, clip: fitz.Rect, target_width: int = 950):
+    """Render only a small page region at an OCR-friendly resolution."""
+    scale = max(0.5, min(3.0, target_width / max(clip.width, 1)))
+    pix = page.get_pixmap(
+        matrix=fitz.Matrix(scale, scale),
+        clip=clip,
+        alpha=False,
+    )
+    try:
+        return pixmap_to_pil_image(pix)
+    finally:
+        del pix
+
+
+def get_ocr_region(
+    page: fitz.Page,
+    relative_box: tuple[float, float, float, float],
+    target_width: int,
+):
+    """Render only the text band needed for OCR and enhance its contrast."""
+    from PIL import ImageOps
+
+    width = page.rect.width
+    height = page.rect.height
+    left, top, right, bottom = relative_box
+    crop = render_ocr_crop(
+        page,
+        fitz.Rect(
+            width * left,
+            height * top,
+            width * right,
+            height * bottom,
+        ),
+        target_width=target_width,
+    )
+
+    enhanced = ImageOps.autocontrast(ImageOps.grayscale(crop), cutoff=1)
+    crop.close()
+    bordered = ImageOps.expand(enhanced, border=24, fill="white")
+    enhanced.close()
+    return bordered
+
+
+def ensure_ocr_available():
+    """Fail clearly when Streamlit did not install the OCR dependencies."""
+    try:
+        import pytesseract
+
+        pytesseract.get_tesseract_version()
+    except Exception as exc:
+        raise RuntimeError(
+            "This PDF contains image-only pages, but OCR is unavailable. "
+            "Commit both requirements.txt and packages.txt to the repository "
+            "root, then reboot the Streamlit app."
+        ) from exc
+
+
+def get_ocr_title(page: fitz.Page) -> str:
+    """OCR the upper-left title and select its largest contiguous line group."""
+    import pytesseract
+    from pytesseract import Output
+
+    image = get_ocr_region(
+        page,
+        (0.02, 0.12, 0.36, 0.35),
+        target_width=900,
+    )
+    try:
+        data = pytesseract.image_to_data(
+            image,
+            config="--oem 1 --psm 6",
+            output_type=Output.DICT,
+            timeout=15,
+        )
+    finally:
+        image.close()
+
+    grouped_lines = {}
+    for index, word in enumerate(data.get("text", [])):
+        word = word.strip()
+        try:
+            confidence = float(data["conf"][index])
+        except (TypeError, ValueError):
+            confidence = -1
+        if not word or confidence < 20:
+            continue
+        key = (
+            data["block_num"][index],
+            data["par_num"][index],
+            data["line_num"][index],
+        )
+        grouped_lines.setdefault(key, []).append({
+            "text": word,
+            "top": data["top"][index],
+            "height": data["height"][index],
+        })
+
+    lines = []
+    for words in grouped_lines.values():
+        lines.append({
+            "text": " ".join(word["text"] for word in words),
+            "top": min(word["top"] for word in words),
+            "height": max(word["height"] for word in words),
+        })
+    if not lines:
+        return ""
+
+    largest_height = max(line["height"] for line in lines)
+    prominent = [
+        line for line in lines if line["height"] >= largest_height * 0.68
     ]
-    return " ".join(title_lines).strip()
+    clusters = []
+    for line in sorted(prominent, key=lambda item: item["top"]):
+        if not clusters:
+            clusters.append([line])
+            continue
+        previous = clusters[-1][-1]
+        previous_bottom = previous["top"] + previous["height"]
+        if line["top"] - previous_bottom <= largest_height * 1.35:
+            clusters[-1].append(line)
+        else:
+            clusters.append([line])
+
+    best_cluster = max(
+        clusters,
+        key=lambda cluster: (
+            len(cluster),
+            sum(line["height"] for line in cluster) / len(cluster),
+            sum(len(line["text"]) for line in cluster),
+            -cluster[0]["top"],
+        ),
+    )
+    return " ".join(line["text"] for line in best_cluster).strip()
+
+
+def extract_manager_from_ocr_text(text: str) -> str:
+    """Extract a legal entity or company name from the manager description."""
+    def company_before_description(value: str) -> str:
+        value = re.sub(r"\s+", " ", value).strip()
+        value = re.sub(r"^[^A-Za-z0-9]+", "", value)
+        match = re.match(
+            r"^([A-Z][A-Za-z0-9&'().,\-]*(?:\s+[A-Za-z0-9&'().,\-]+){0,7}?)"
+            r"\s+(?:builds?|provides?|offers?|manages?|creates?|is|speciali[sz]es?)\b",
+            value,
+            re.IGNORECASE,
+        )
+        return match.group(1).strip().rstrip(".,") if match else ""
+
+    for raw_line in text.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        manager = extract_legal_entity_name(line)
+        if manager:
+            return manager
+        manager = company_before_description(line)
+        if manager:
+            return manager
+
+    # OCR may put the company and the opening verb on adjacent lines.
+    return company_before_description(text)
+
+
+def get_ocr_manager(page: fitz.Page) -> str:
+    """OCR the manager/company description beneath the lower-right SEBI area."""
+    import pytesseract
+
+    image = get_ocr_region(
+        page,
+        (0.40, 0.80, 0.97, 0.93),
+        target_width=1300,
+    )
+    try:
+        text = pytesseract.image_to_string(
+            image,
+            config="--oem 1 --psm 6",
+            timeout=15,
+        )
+    finally:
+        image.close()
+    return extract_manager_from_ocr_text(text)
+
+
+def get_ocr_page_identity(page: fitz.Page) -> tuple[str, str]:
+    """Return OCR title and manager, degrading safely if OCR is unavailable."""
+    try:
+        title = get_ocr_title(page)
+    except Exception:
+        title = ""
+    try:
+        manager = get_ocr_manager(page)
+    except Exception:
+        manager = ""
+    return title, manager
 
 
 def get_manager_name(page: fitz.Page) -> str:
@@ -416,15 +767,29 @@ def convert_pdf_bytes(
     output_dir.mkdir(parents=True, exist_ok=True)
     thumbnail_dir = output_dir / "thumbnails"
     thumbnail_dir.mkdir(parents=True, exist_ok=True)
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    source_pdf_path = output_dir / safe_pdf_name(original_name)
+    pdf_bytes.seek(0)
+    with source_pdf_path.open("wb") as source_pdf:
+        shutil.copyfileobj(pdf_bytes, source_pdf, length=1024 * 1024)
+    doc = fitz.open(str(source_pdf_path))
     try:
         total_pages = len(doc)
+        ocr_checked = False
         for i, page in enumerate(doc, start=1):
-            legal_manager = get_lower_right_legal_manager(page)
-            manager_raw = legal_manager or get_manager_name(page)
-            title_raw = (
-                get_upper_left_title(page) if legal_manager else get_page_title(page)
-            )
+            page_text = page.get_text("text", sort=True).strip()
+            if len(page_text) < 20:
+                if not ocr_checked:
+                    ensure_ocr_available()
+                    ocr_checked = True
+                title_raw, manager_raw = get_ocr_page_identity(page)
+            else:
+                legal_manager = get_lower_right_legal_manager(page)
+                manager_raw = legal_manager or get_manager_name(page)
+                title_raw = (
+                    get_upper_left_title(page)
+                    if legal_manager
+                    else get_page_title(page)
+                )
             title_raw = title_raw or get_page_title(page) or f"Page {i:03d}"
             display_name = (
                 f"{title_raw} by {manager_raw}" if manager_raw else title_raw
@@ -440,12 +805,18 @@ def convert_pdf_bytes(
                 else f"{title} ({occurrence}).png"
             )
 
-            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+            target_width = OUTPUT_WIDTHS.get(zoom, 900)
+            render_scale = target_width / max(page.rect.width, 1)
+            pix = page.get_pixmap(
+                matrix=fitz.Matrix(render_scale, render_scale),
+                alpha=False,
+            )
             image_path = output_dir / filename
             pix.save(str(image_path))
             del pix
+            thumbnail_scale = 280 / max(page.rect.width, 1)
             thumbnail_pix = page.get_pixmap(
-                matrix=fitz.Matrix(0.45, 0.45),
+                matrix=fitz.Matrix(thumbnail_scale, thumbnail_scale),
                 alpha=False,
             )
             thumbnail_path = thumbnail_dir / filename
@@ -461,10 +832,13 @@ def convert_pdf_bytes(
             })
             if progress_callback is not None:
                 progress_callback(i, total_pages)
+            # Periodically reclaim cyclic buffers without slowing every page.
+            if i % 4 == 0:
+                gc.collect()
     finally:
         doc.close()
 
-    return total_pages, results
+    return total_pages, results, str(source_pdf_path)
 
 
 def format_file_size(size_bytes: int) -> str:
@@ -478,17 +852,24 @@ def output_zip_name(original_name: str) -> str:
 
 
 def build_output_zip(output: dict, results: list[dict]) -> str:
-    """Build or reuse a disk-backed ZIP containing the selected pages."""
-    signature = ",".join(str(item["page"]) for item in results)
+    """Build or reuse a ZIP containing the source PDF and selected pages."""
+    signature = "pdf+|" + "|".join(
+        f"{item['page']}:{item['filename']}" for item in results
+    )
     zip_path = Path(output["working_dir"]) / "selected_images.zip"
     if output.get("zip_signature") == signature and zip_path.exists():
         return str(zip_path)
 
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as archive:
+        package_folder = safe_name(Path(output["original_name"]).stem)
+        archive.write(
+            output["source_pdf_path"],
+            f"{package_folder}/{safe_pdf_name(output['original_name'])}",
+        )
         for item in results:
             archive.write(
                 item["image_path"],
-                f"{item['folder']}/{item['filename']}",
+                f"{package_folder}/{item['filename']}",
             )
     output["zip_signature"] = signature
     return str(zip_path)
@@ -499,8 +880,36 @@ def page_selection_key(output: dict, output_index: int, page: int) -> str:
     return f"keep_page_{batch_id}_{output_index}_{page}"
 
 
+def page_rename_key(output: dict, output_index: int, page: int) -> str:
+    batch_id = output.get("batch_id", "current")
+    return f"rename_page_{batch_id}_{output_index}_{page}"
+
+
+def apply_page_rename(
+    output: dict,
+    item: dict,
+    rename_key: str,
+):
+    """Apply a safe, unique PNG filename entered in the review screen."""
+    requested = str(st.session_state.get(rename_key, "")).strip()
+    requested = re.sub(r"\.png$", "", requested, flags=re.IGNORECASE)
+    requested = safe_name(requested)
+    candidate = f"{requested}.png"
+    existing_names = {
+        other["filename"].casefold()
+        for other in output["results"]
+        if other["page"] != item["page"]
+    }
+    if candidate.casefold() in existing_names:
+        candidate = f"{requested} (page {item['page']}).png"
+        st.session_state[rename_key] = Path(candidate).stem
+    item["filename"] = candidate
+    item["title"] = Path(candidate).stem
+    output["zip_signature"] = None
+
+
 def selected_output(output: dict, output_index: int) -> dict:
-    """Return an output copy containing only currently selected pages."""
+    """Return selected pages without eagerly building a download in memory."""
     if output["error"] is not None:
         return output
 
@@ -512,12 +921,9 @@ def selected_output(output: dict, output_index: int) -> dict:
             True,
         )
     ]
-    zip_path = (
-        build_output_zip(output, kept_results) if kept_results else None
-    )
     filtered = dict(output)
     filtered["results"] = kept_results
-    filtered["zip_path"] = zip_path
+    filtered["zip_path"] = None
     return filtered
 
 
@@ -616,6 +1022,23 @@ def render_page_review(output: dict, output_index: int):
                         item["thumbnail_path"],
                         caption=f"Page {item['page']} · {item['filename']}",
                         use_container_width=True,
+                    )
+                    rename_key = page_rename_key(
+                        output,
+                        output_index,
+                        item["page"],
+                    )
+                    if rename_key not in st.session_state:
+                        st.session_state[rename_key] = Path(
+                            item["filename"]
+                        ).stem
+                    st.text_input(
+                        f"Filename for page {item['page']}",
+                        key=rename_key,
+                        on_change=apply_page_rename,
+                        args=(output, item, rename_key),
+                        help="Edit the detected name if OCR needs correction. "
+                        "The .png extension is added automatically.",
                     )
                     if st.button(
                         f"Delete page {item['page']}",
@@ -716,14 +1139,26 @@ def build_drive_service(token: dict, config):
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
 
-def collect_converted_pngs(outputs: list[dict]) -> list[tuple[str, str]]:
-    """Return selected PNG names and disk paths without copying file data."""
-    images = []
+def collect_report_files(outputs: list[dict]) -> list[tuple[str, str, str]]:
+    """Return each source PDF and its selected PNGs without copying data."""
+    files = []
     used_names = {}
 
     for output in outputs:
         if output["error"] is not None or not output["results"]:
             continue
+        source_name = safe_pdf_name(output["original_name"])
+        source_key = source_name.casefold()
+        used_names[source_key] = used_names.get(source_key, 0) + 1
+        source_occurrence = used_names[source_key]
+        if source_occurrence > 1:
+            source_path = Path(source_name)
+            source_name = (
+                f"{source_path.stem} ({source_occurrence}){source_path.suffix}"
+            )
+        files.append(
+            (source_name, output["source_pdf_path"], "application/pdf")
+        )
         for item in output["results"]:
             base_name = Path(item["filename"]).name
             name_key = base_name.casefold()
@@ -736,9 +1171,9 @@ def collect_converted_pngs(outputs: list[dict]) -> list[tuple[str, str]]:
                 image_name = (
                     f"{image_path.stem} ({occurrence}){image_path.suffix}"
                 )
-            images.append((image_name, item["image_path"]))
+            files.append((image_name, item["image_path"], "image/png"))
 
-    return images
+    return files
 
 
 def list_folder_contents(service, folder_id: str) -> list[dict]:
@@ -798,18 +1233,22 @@ def list_child_folders(service, root_folder_id: str) -> tuple[dict, list[dict]]:
     return root_folder, folders
 
 
-def is_replaceable_drive_image(item: dict) -> bool:
-    """Identify direct PNG/JPG files while excluding folders and other files."""
+def is_replaceable_drive_asset(item: dict) -> bool:
+    """Identify direct PDF/PNG/JPG files, excluding folders and other files."""
     mime_type = (item.get("mimeType") or "").casefold()
     if mime_type == "application/vnd.google-apps.folder":
         return False
-    return mime_type in {"image/png", "image/jpeg"} or Path(
+    return mime_type in {"application/pdf", "image/png", "image/jpeg"} or Path(
         item.get("name", "")
-    ).suffix.casefold() in {".png", ".jpg", ".jpeg"}
+    ).suffix.casefold() in {".pdf", ".png", ".jpg", ".jpeg"}
 
 
-def replace_drive_folder(service, folder_id: str, images: list[tuple[str, str]]):
-    """Replace direct PNG/JPG files, with best-effort rollback on error."""
+def replace_drive_folder(
+    service,
+    folder_id: str,
+    report_files: list[tuple[str, str, str]],
+):
+    """Replace direct PDF/image files, with best-effort rollback on error."""
     from googleapiclient.http import MediaFileUpload
 
     folder = service.files().get(
@@ -823,7 +1262,7 @@ def replace_drive_folder(service, folder_id: str, images: list[tuple[str, str]])
     existing_items = [
         item
         for item in list_folder_contents(service, folder_id)
-        if is_replaceable_drive_image(item)
+        if is_replaceable_drive_asset(item)
     ]
     blocked_items = [
         item["name"]
@@ -840,21 +1279,21 @@ def replace_drive_folder(service, folder_id: str, images: list[tuple[str, str]])
     trashed_ids = []
     try:
         # Upload first. If an upload fails, the old folder remains unchanged.
-        for image_name, image_path in images:
+        for file_name, file_path, mime_type in report_files:
             media = MediaFileUpload(
-                image_path,
-                mimetype="image/png",
+                file_path,
+                mimetype=mime_type,
                 resumable=False,
             )
             created = service.files().create(
-                body={"name": image_name, "parents": [folder_id]},
+                body={"name": file_name, "parents": [folder_id]},
                 media_body=media,
                 fields="id",
                 supportsAllDrives=True,
             ).execute()
             uploaded_ids.append(created["id"])
 
-        # All uploads succeeded; move only previous direct image files to Trash.
+        # All uploads succeeded; move previous direct report files to Trash.
         for item in existing_items:
             service.files().update(
                 fileId=item["id"],
@@ -910,8 +1349,8 @@ def render_drive_connection(outputs: list[dict]):
             "Connect once, then choose a broker subfolder beside each report."
         )
 
-        images = collect_converted_pngs(outputs)
-        if not images:
+        report_files = collect_report_files(outputs)
+        if not report_files:
             st.info("Convert at least one eligible PDF page to enable Drive sync.")
             return None, []
 
@@ -1012,9 +1451,10 @@ def render_report_drive_sync(
     output: dict,
     output_index: int,
 ):
-    images = collect_converted_pngs([output])
-    if not images:
+    report_files = collect_report_files([output])
+    if not report_files:
         return
+    png_count = len(output["results"])
 
     if service is None or not broker_folders:
         st.button(
@@ -1050,16 +1490,17 @@ def render_report_drive_sync(
         selected_folder_name = selected_folder["name"]
 
         st.warning(
-            f"This will move all PNG/JPG files directly inside "
-            f"“{selected_folder_name}” to Drive Trash, then upload {len(images)} "
-            "new PNGs. Non-image files and nested folders will remain untouched."
+            f"This will move all PDF, PNG, and JPG files directly inside "
+            f"“{selected_folder_name}” to Drive Trash, then upload the original "
+            f"PDF and {png_count} selected PNG{'s' if png_count != 1 else ''}. "
+            "Other file types and nested folders will remain untouched."
         )
         confirmed = st.checkbox(
-            f"Replace the existing images in “{selected_folder_name}”.",
+            f"Replace the existing report files in “{selected_folder_name}”.",
             key=f"drive_sync_confirm_{output_index}",
         )
         sync_clicked = st.button(
-            f"Replace folder with {len(images)} PNGs",
+            f"Sync PDF + {png_count} PNG{'s' if png_count != 1 else ''}",
             type="primary",
             disabled=not confirmed,
             key=f"drive_sync_{output_index}",
@@ -1072,14 +1513,15 @@ def render_report_drive_sync(
                     folder_name, removed_count, uploaded_count = replace_drive_folder(
                         service,
                         folder_id,
-                        images,
+                        report_files,
                     )
                 except Exception as exc:
                     st.error(f"Drive sync failed: {exc}")
                 else:
                     st.success(
-                        f"Synced {uploaded_count} PNGs to “{folder_name}”. "
-                        f"Moved {removed_count} previous image files to Trash."
+                        f"Synced {uploaded_count} files: the PDF and {png_count} PNG"
+                        f"{'s' if png_count != 1 else ''} to “{folder_name}”. "
+                        f"Moved {removed_count} previous report files to Trash."
                     )
 
 
@@ -1087,14 +1529,19 @@ st.markdown(
     """
     <div class="app-hero">
         <div class="app-mark">PNG</div>
-        <div>
+        <div class="app-hero-copy">
             <h1>PDF page exporter</h1>
-            <p>Convert every PDF page to a crisp PNG, review what you want to keep, then download or sync only your final selection.</p>
+            <p>Turn PDF reports into neatly named PNGs, review every page, and send the finished package exactly where it needs to go.</p>
+            <div class="hero-meta" aria-label="Output details">
+                <span>Original PDF included</span>
+                <span>Editable filenames</span>
+                <span>ZIP or Google Drive</span>
+            </div>
         </div>
     </div>
     <div class="workflow-note" aria-label="Conversion steps">
         <span><strong>1.</strong> Select one or more PDFs</span>
-        <span><strong>2.</strong> Delete unwanted images</span>
+        <span><strong>2.</strong> Review, rename, or delete images</span>
         <span><strong>3.</strong> Download or sync the pages you keep</span>
     </div>
     """,
@@ -1102,12 +1549,14 @@ st.markdown(
 )
 
 st.subheader("Upload PDFs")
-st.caption("Select multiple files in one go. Each PDF is processed independently.")
-st.info(
-    "**Every page is converted.** The app supports both one-pager layouts and "
-    "names portfolio pages `Smallcase by Manager`; all other pages use their "
-    "detected page title. After conversion, use the bin button to remove images "
-    "you do not want."
+st.caption("Add one or more reports. Each PDF is processed as its own package.")
+st.markdown(
+    '<div class="conversion-note"><strong>Every page is converted.</strong> '
+    'Portfolio pages are named <code>Smallcase by Manager</code>; other pages '
+    'use their detected title. You can correct any filename or remove unwanted '
+    'pages before export. The original PDF is always included with the PNGs '
+    'you keep.</div>',
+    unsafe_allow_html=True,
 )
 uploaded_files = st.file_uploader(
     "Choose PDF files",
@@ -1121,18 +1570,16 @@ control_col, action_col = st.columns([1.15, 1], vertical_alignment="bottom")
 with control_col:
     zoom = st.select_slider(
         "Image resolution",
-        options=[1.0, 1.5, 2.0, 2.5, 3.0],
-        value=1.5,
+        options=[1.0, 1.5, 2.0],
+        value=1.0,
         format_func=lambda value: {
             1.0: "Standard",
             1.5: "Balanced",
             2.0: "High",
-            2.5: "Very high",
-            3.0: "Maximum",
         }[value],
         help=(
-            "Balanced is recommended for speed. Higher resolutions create "
-            "sharper PNGs but take longer and use substantially more memory."
+            "Standard is recommended on Streamlit Community Cloud. Higher "
+            "resolutions create sharper PNGs but use more memory."
         ),
     )
 
@@ -1152,7 +1599,12 @@ if uploaded_files:
         f"({format_file_size(total_upload_size)} total)."
     )
 
-if "conversion_outputs" not in st.session_state:
+if st.session_state.get("app_state_version") != APP_STATE_VERSION:
+    cleanup_batch_temp_dir(st.session_state.get("batch_temp_dir"))
+    st.session_state.pop("batch_temp_dir", None)
+    st.session_state.conversion_outputs = []
+    st.session_state.app_state_version = APP_STATE_VERSION
+elif "conversion_outputs" not in st.session_state:
     st.session_state.conversion_outputs = []
 elif any(
     output.get("results")
@@ -1189,8 +1641,9 @@ if process and uploaded_files:
             )
 
         try:
-            total_pages, results = convert_pdf_bytes(
-                uploaded.getvalue(),
+            uploaded.seek(0)
+            total_pages, results, source_pdf_path = convert_pdf_bytes(
+                uploaded,
                 uploaded.name,
                 working_dir,
                 zoom=zoom,
@@ -1202,6 +1655,7 @@ if process and uploaded_files:
                 "total_pages": total_pages,
                 "results": results,
                 "working_dir": str(working_dir),
+                "source_pdf_path": source_pdf_path,
                 "zip_signature": None,
                 "error": None,
             })
@@ -1212,6 +1666,7 @@ if process and uploaded_files:
                 "total_pages": 0,
                 "results": [],
                 "working_dir": str(working_dir),
+                "source_pdf_path": None,
                 "zip_signature": None,
                 "error": str(exc),
             })
@@ -1225,8 +1680,8 @@ if st.session_state.conversion_outputs:
     st.divider()
     st.subheader("Your downloads")
     st.caption(
-        "Download every PDF separately, or download one master ZIP containing "
-        "all the individual ZIP files."
+        "Each report ZIP contains its original PDF and the PNG pages you kept. "
+        "You can also download one master ZIP containing every report package."
     )
 
     selected_conversion_outputs = [
@@ -1247,26 +1702,77 @@ if st.session_state.conversion_outputs:
         if output["error"] is None and output["results"]
     ]
 
-    summary_col, batch_download_col = st.columns(
-        [1.7, 1],
-        vertical_alignment="center",
-    )
-    with summary_col:
-        if successful_outputs:
-            st.success(
-                f"Finished {successful_outputs} of "
-                f"{len(st.session_state.conversion_outputs)} PDF files."
+    if successful_outputs:
+        st.success(
+            f"Finished {successful_outputs} of "
+            f"{len(st.session_state.conversion_outputs)} PDF files."
+        )
+
+    # Streamlit keeps download payloads in memory. Offer one selected payload
+    # at a time instead of preloading every report ZIP plus the master ZIP.
+    if downloadable_outputs:
+        download_options = [
+            f"report:{index}" for index, output in enumerate(
+                selected_conversion_outputs
             )
-    with batch_download_col:
+            if output["error"] is None and output["results"]
+        ]
         if len(downloadable_outputs) > 1:
-            batch_zip_path = create_batch_zip(downloadable_outputs)
-            with open(batch_zip_path, "rb") as batch_zip_file:
+            download_options.append("all")
+
+        def download_label(option: str) -> str:
+            if option == "all":
+                return f"All {len(downloadable_outputs)} report ZIPs"
+            output_index = int(option.split(":", 1)[1])
+            return selected_conversion_outputs[output_index]["original_name"]
+
+        selector_col, button_col = st.columns(
+            [1.7, 1],
+            vertical_alignment="bottom",
+        )
+        with selector_col:
+            download_choice = st.selectbox(
+                "Choose a download",
+                options=download_options,
+                format_func=download_label,
+                key="download_choice",
+            )
+
+        if download_choice == "all":
+            prepared_outputs = []
+            for output_index, output in enumerate(selected_conversion_outputs):
+                if output["error"] is not None or not output["results"]:
+                    continue
+                source_output = st.session_state.conversion_outputs[output_index]
+                prepared = dict(output)
+                prepared["zip_path"] = build_output_zip(
+                    source_output,
+                    output["results"],
+                )
+                prepared["zip_signature"] = source_output["zip_signature"]
+                prepared_outputs.append(prepared)
+            download_path = create_batch_zip(prepared_outputs)
+            download_name = "all_pdf_image_zips.zip"
+            download_text = f"Download all {len(prepared_outputs)} ZIPs"
+        else:
+            chosen_index = int(download_choice.split(":", 1)[1])
+            chosen_output = selected_conversion_outputs[chosen_index]
+            source_output = st.session_state.conversion_outputs[chosen_index]
+            download_path = build_output_zip(
+                source_output,
+                chosen_output["results"],
+            )
+            download_name = output_zip_name(chosen_output["original_name"])
+            download_text = "Download selected ZIP"
+
+        with button_col:
+            with open(download_path, "rb") as selected_zip_file:
                 st.download_button(
-                    label=f"Download all {len(downloadable_outputs)} ZIPs",
-                    data=batch_zip_file,
-                    file_name="all_pdf_image_zips.zip",
+                    label=download_text,
+                    data=selected_zip_file,
+                    file_name=download_name,
                     mime="application/zip",
-                    key="download_all_zips",
+                    key=f"download_selected_{download_choice}",
                     use_container_width=True,
                 )
 
@@ -1279,8 +1785,8 @@ if st.session_state.conversion_outputs:
                 st.error(f"This PDF could not be processed: {output['error']}")
                 continue
 
-            result_col, download_col, drive_col = st.columns(
-                [1.7, 0.8, 0.8],
+            result_col, drive_col = st.columns(
+                [2.5, 0.8],
                 vertical_alignment="center",
             )
             with result_col:
@@ -1296,18 +1802,12 @@ if st.session_state.conversion_outputs:
                     '</div>',
                     unsafe_allow_html=True,
                 )
-            with download_col:
-                zip_name = output_zip_name(output["original_name"])
-                if converted_count:
-                    with open(output["zip_path"], "rb") as zip_file:
-                        st.download_button(
-                            label="Download ZIP",
-                            data=zip_file,
-                            file_name=zip_name,
-                            mime="application/zip",
-                            key=f"download_{output_index}_{zip_name}",
-                            use_container_width=True,
-                        )
+                st.markdown(
+                    '<div class="package-note"><strong>Package:</strong> original '
+                    f'PDF + {converted_count} selected PNG'
+                    f'{"s" if converted_count != 1 else ""}</div>',
+                    unsafe_allow_html=True,
+                )
             with drive_col:
                 if converted_count:
                     render_report_drive_sync(
